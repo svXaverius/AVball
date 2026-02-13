@@ -597,6 +597,17 @@
     }
     bind(canvas) {
       this.canvas = canvas;
+      // request fullscreen on first touch (mobile)
+      if (this.mobile) {
+        const fsEl = document.documentElement;
+        const fsReq = fsEl.requestFullscreen || fsEl.webkitRequestFullscreen;
+        if (fsReq) {
+          canvas.addEventListener("touchstart", function goFS() {
+            canvas.removeEventListener("touchstart", goFS);
+            fsReq.call(fsEl).catch(() => {});
+          }, { once: true });
+        }
+      }
       canvas.addEventListener(
         "touchstart",
         (e) => {
