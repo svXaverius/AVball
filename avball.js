@@ -17,9 +17,9 @@
   const HEAD_R = 9;
   const P_HEIGHT = 24; // feet to head center
   const GRAVITY = 0.055;
-  const P_GRAVITY = 0.063;
-  const P_SPEED = 1.25;
-  const JUMP_VEL = -1.55;
+  const P_GRAVITY = 0.126;
+  const P_SPEED = 2.5;
+  const JUMP_VEL = -3.1;
   const WIN_SCORE = 15;
   const BOUNCE_DAMP = 0.85;
 
@@ -276,6 +276,7 @@
       this.y = 0;
       this.vx = 0;
       this.vy = 0;
+      this.rot = 0;
       this.trail = [];
     }
     serve(side) {
@@ -283,12 +284,14 @@
       this.y = 30;
       this.vx = 0;
       this.vy = 0;
+      this.rot = 0;
       this.trail = [];
     }
     update(snd) {
       this.vy += GRAVITY;
       this.x += this.vx;
       this.y += this.vy;
+      this.rot += this.vx * 0.06;
 
       // walls — no energy loss (authentic to original)
       if (this.x - BALL_R < 0) {
@@ -424,28 +427,77 @@
       );
       ctx.fill();
 
-      // ball
-      ctx.fillStyle = PAL.ball;
+      // volleyball ball
+      const bx = Math.round(this.x);
+      const by = Math.round(this.y);
+      const r = BALL_R;
+
+      // base circle — off-white
+      ctx.fillStyle = "#F0E8D0";
       ctx.beginPath();
-      ctx.arc(
-        Math.round(this.x),
-        Math.round(this.y),
-        BALL_R,
-        0,
-        Math.PI * 2
-      );
+      ctx.arc(bx, by, r, 0, Math.PI * 2);
       ctx.fill();
 
-      // highlight
-      ctx.fillStyle = "rgba(255,255,255,0.4)";
+      // panel seams (3 curved lines that rotate with the ball)
+      ctx.save();
       ctx.beginPath();
-      ctx.arc(
-        Math.round(this.x) - 1,
-        Math.round(this.y) - 1,
-        BALL_R * 0.35,
-        0,
-        Math.PI * 2
+      ctx.arc(bx, by, r, 0, Math.PI * 2);
+      ctx.clip();
+
+      ctx.strokeStyle = "#CC3333";
+      ctx.lineWidth = 1;
+      const rot = this.rot;
+
+      // vertical seam
+      ctx.beginPath();
+      ctx.moveTo(bx + Math.cos(rot) * r * 0.05, by - r);
+      ctx.quadraticCurveTo(
+        bx + Math.cos(rot) * r * 0.6,
+        by,
+        bx + Math.cos(rot) * r * 0.05,
+        by + r
       );
+      ctx.stroke();
+
+      // left curved seam
+      ctx.beginPath();
+      ctx.moveTo(bx + Math.cos(rot + 2.1) * r * 0.4, by - r);
+      ctx.quadraticCurveTo(
+        bx + Math.cos(rot + 2.1) * r * 0.9,
+        by,
+        bx + Math.cos(rot + 2.1) * r * 0.4,
+        by + r
+      );
+      ctx.stroke();
+
+      // right curved seam
+      ctx.beginPath();
+      ctx.moveTo(bx + Math.cos(rot - 2.1) * r * 0.4, by - r);
+      ctx.quadraticCurveTo(
+        bx + Math.cos(rot - 2.1) * r * 0.9,
+        by,
+        bx + Math.cos(rot - 2.1) * r * 0.4,
+        by + r
+      );
+      ctx.stroke();
+
+      // horizontal seam
+      ctx.beginPath();
+      ctx.moveTo(bx - r, by + Math.sin(rot) * r * 0.1);
+      ctx.quadraticCurveTo(
+        bx,
+        by + Math.sin(rot) * r * 0.5,
+        bx + r,
+        by + Math.sin(rot) * r * 0.1
+      );
+      ctx.stroke();
+
+      ctx.restore();
+
+      // highlight
+      ctx.fillStyle = "rgba(255,255,255,0.35)";
+      ctx.beginPath();
+      ctx.arc(bx - 2, by - 2, r * 0.3, 0, Math.PI * 2);
       ctx.fill();
     }
   }
