@@ -11,14 +11,14 @@
   const H = 200;
   const GROUND_Y = 176;
   const NET_X = W / 2;
-  const NET_TOP = 126;
+  const NET_TOP = 101;
   const NET_W = 3;
   const BALL_R = 9;
   const HEAD_R = 9;
   const P_HEIGHT = 24; // feet to head center
   const GRAVITY = 0.055;
-  const P_GRAVITY = 0.095;
-  const P_SPEED = 0.625;
+  const P_GRAVITY = 0.063;
+  const P_SPEED = 1.25;
   const JUMP_VEL = -1.55;
   const WIN_SCORE = 15;
   const BOUNCE_DAMP = 0.85;
@@ -369,23 +369,23 @@
       }
 
       // add player velocity influence
-      this.vx += p.vx * 0.3;
-      this.vy += p.vy * 0.5;
+      this.vx += p.vx * 0.5;
+      this.vy += p.vy * 0.7;
 
       // ensure upward bounce when hit from below
-      if (ny < -0.2 && this.vy > -0.375) {
-        this.vy = -0.75;
+      if (ny < -0.2 && this.vy > -0.75) {
+        this.vy = -1.5;
       }
 
       // damping
-      this.vx *= 0.92;
-      this.vy *= 0.92;
+      this.vx *= 0.95;
+      this.vy *= 0.95;
 
       // speed limit
       const spd = Math.sqrt(this.vx * this.vx + this.vy * this.vy);
-      if (spd > 2) {
-        this.vx = (this.vx / spd) * 2;
-        this.vy = (this.vy / spd) * 2;
+      if (spd > 3.5) {
+        this.vx = (this.vx / spd) * 3.5;
+        this.vy = (this.vy / spd) * 3.5;
       }
 
       snd.hit();
