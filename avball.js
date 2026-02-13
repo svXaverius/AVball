@@ -597,21 +597,21 @@
     }
     bind(canvas) {
       this.canvas = canvas;
-      // request fullscreen on first touch (mobile)
-      if (this.mobile) {
-        const fsEl = document.documentElement;
-        const fsReq = fsEl.requestFullscreen || fsEl.webkitRequestFullscreen;
-        if (fsReq) {
-          canvas.addEventListener("touchstart", function goFS() {
-            canvas.removeEventListener("touchstart", goFS);
-            fsReq.call(fsEl).catch(() => {});
-          }, { once: true });
-        }
-      }
+      this._didFS = false;
       canvas.addEventListener(
         "touchstart",
         (e) => {
           e.preventDefault();
+          // request fullscreen once (Android Chrome, Firefox, Samsung Internet)
+          if (this.mobile && !this._didFS) {
+            this._didFS = true;
+            const el = document.documentElement;
+            const rfs = el.requestFullscreen
+              || el.webkitRequestFullscreen
+              || el.mozRequestFullScreen
+              || el.msRequestFullscreen;
+            if (rfs) rfs.call(el).catch(() => {});
+          }
           const r = canvas.getBoundingClientRect();
           const mid = r.width / 2;
           for (const t of e.changedTouches) {
