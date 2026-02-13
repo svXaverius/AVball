@@ -16,10 +16,10 @@
   const BALL_R = 9;
   const HEAD_R = 9;
   const P_HEIGHT = 24; // feet to head center
-  const GRAVITY = 0.11;
-  const P_GRAVITY = 0.19;
-  const P_SPEED = 1.25;
-  const JUMP_VEL = -3.1;
+  const GRAVITY = 0.055;
+  const P_GRAVITY = 0.095;
+  const P_SPEED = 0.625;
+  const JUMP_VEL = -1.55;
   const WIN_SCORE = 15;
   const BOUNCE_DAMP = 0.85;
 
@@ -373,8 +373,8 @@
       this.vy += p.vy * 0.5;
 
       // ensure upward bounce when hit from below
-      if (ny < -0.2 && this.vy > -0.75) {
-        this.vy = -1.5;
+      if (ny < -0.2 && this.vy > -0.375) {
+        this.vy = -0.75;
       }
 
       // damping
@@ -383,9 +383,9 @@
 
       // speed limit
       const spd = Math.sqrt(this.vx * this.vx + this.vy * this.vy);
-      if (spd > 4) {
-        this.vx = (this.vx / spd) * 4;
-        this.vy = (this.vy / spd) * 4;
+      if (spd > 2) {
+        this.vx = (this.vx / spd) * 2;
+        this.vy = (this.vy / spd) * 2;
       }
 
       snd.hit();
