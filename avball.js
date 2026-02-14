@@ -748,12 +748,18 @@
       this.resize();
       window.addEventListener("resize", () => this.resize());
 
-      this.lastT = 0;
+      this.lastT = -1;
+      this.acc = 0;
+      const STEP = 1000 / 60; // fixed 60 Hz update
       const loop = (ts) => {
-        const dt = ts - this.lastT;
+        if (this.lastT < 0) this.lastT = ts;
+        const dt = Math.min(ts - this.lastT, 100); // cap at 100ms to avoid spiral
         this.lastT = ts;
-        const steps = Math.min(Math.round(dt / (1000 / 60)), 4) || 1;
-        for (let i = 0; i < steps; i++) this.update();
+        this.acc += dt;
+        while (this.acc >= STEP) {
+          this.update();
+          this.acc -= STEP;
+        }
         this.draw();
         requestAnimationFrame(loop);
       };
