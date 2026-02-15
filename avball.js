@@ -750,13 +750,10 @@
     }
 
     async init() {
-      // Wait up to 5s for ESM module to load and set window.nakamajs
-      for (let i = 0; i < 50 && !window.nakamajs; i++) {
-        await new Promise(r => setTimeout(r, 100));
-      }
-      if (!window.nakamajs) return;
       try {
-        this.client = new window.nakamajs.Client(NAKAMA_KEY, NAKAMA_HOST, NAKAMA_PORT, NAKAMA_SSL);
+        // Dynamic import — no separate module script needed
+        const nakamajs = await import('/static/nakama-js.esm.mjs');
+        this.client = new nakamajs.Client(NAKAMA_KEY, NAKAMA_HOST, NAKAMA_PORT, NAKAMA_SSL);
         // Route through Caddy /nakama/ path
         this.client.basePath = "/nakama";
 
@@ -925,7 +922,7 @@
         this.state = ST.ONLINE_OVER;
         this.snd.win();
       };
-      this.nk.init().catch(() => {});
+      this.nk.init().catch(e => console.warn("NK init:", e));
 
       this.score = [0, 0];
       this.serveSide = 0;
