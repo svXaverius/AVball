@@ -750,6 +750,10 @@
     }
 
     async init() {
+      // Wait up to 5s for ESM module to load and set window.nakamajs
+      for (let i = 0; i < 50 && !window.nakamajs; i++) {
+        await new Promise(r => setTimeout(r, 100));
+      }
       if (!window.nakamajs) return;
       try {
         this.client = new nakamajs.Client(NAKAMA_KEY, NAKAMA_HOST, NAKAMA_PORT, NAKAMA_SSL);
