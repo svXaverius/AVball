@@ -1183,153 +1183,143 @@
     }
 
     uOnline() {
-      // If disconnected, return to menu
-      if (!this.nk.connected) {
-        this.state = ST.MENU;
-        return;
-      }
+      if (!this.nk.connected) { this.state = ST.MENU; return; }
 
       const mySide = this.nk.playerSide;
       const myPlayer = mySide === 0 ? this.p1 : this.p2;
       const remotePlayer = mySide === 0 ? this.p2 : this.p1;
+      const myKey = mySide === 0 ? "p1" : "p2";
+      const rmKey = mySide === 0 ? "p2" : "p1";
 
-      // 1. Read local input
       const localInput = this.inp.p1();
+      if (this.frame % 3 === 0) this.nk.sendInput(localInput.dx, localInput.jump);
 
-      // 2. Send input to server at 20Hz (every 3rd frame)
-      if (this.frame % 3 === 0) {
-        this.nk.sendInput(localInput.dx, localInput.jump);
-      }
-
-      // 3. Process new server snapshot if available
+      // --- Process new server snapshot ---
       const ss = this.nk.serverState;
       if (ss && ss !== this._lastApplied) {
         this._lastApplied = ss;
 
-        // Store remote player's input for prediction
-        const remoteInpKey = mySide === 0 ? "inp2" : "inp1";
-        if (ss[remoteInpKey]) {
-          this._remoteInput = ss[remoteInpKey];
-        }
-
-        // Server-authoritative state transitions
-        const prevState = this.state;
         if (ss.state === 1) this.state = ST.SERVE;
         else if (ss.state === 2) this.state = ST.PLAY;
         else if (ss.state === 3) this.state = ST.SCORED;
 
-        // On state transition, apply server state directly
-        if (ss.state !== this._lastServerState) {
-          this._lastServerState = ss.state;
-          this.score = ss.score;
-          this.serveSide = ss.serveSide;
-          this.timer = ss.timer;
-
-          // On score or serve, snap positions (reset)
-          if (ss.state === 1 || ss.state === 3) {
-            const myData = ss[mySide === 0 ? "p1" : "p2"];
-            const rmData = ss[mySide === 0 ? "p2" : "p1"];
-            if (myData) {
-              myPlayer.x = myData.x; myPlayer.y = myData.y;
-              myPlayer.vy = myData.vy; myPlayer.grounded = myData.grounded;
-            }
-            if (rmData) {
-              remotePlayer.x = rmData.x; remotePlayer.y = rmData.y;
-              remotePlayer.vy = rmData.vy; remotePlayer.grounded = rmData.grounded;
-            }
-            if (ss.ball) {
-              this.ball.x = ss.ball.x; this.ball.y = ss.ball.y;
-              this.ball.vx = ss.ball.vx; this.ball.vy = ss.ball.vy;
-              this.ball.rot = ss.ball.rot;
-            }
-            if (ss.state === 3) {
-              this.shake = 8;
-              this.snd.score();
-              this.particles.emit(this.ball.x, GROUND_Y,
-                this.serveSide === 0 ? PAL.p1 : PAL.p2, 8, 4);
-            }
-            return;
-          }
-        }
-
-        // Score/timer always from server
         this.score = ss.score;
         this.serveSide = ss.serveSide;
         this.timer = ss.timer;
 
-        // Smooth corrections — lerp positions toward server
-        const myData = ss[mySide === 0 ? "p1" : "p2"];
-        const rmData = ss[mySide === 0 ? "p2" : "p1"];
-        if (myData) {
-          const dxM = Math.abs(myPlayer.x - myData.x);
-          const dyM = Math.abs(myPlayer.y - myData.y);
-          if (dxM > 15 || dyM > 15) {
-            myPlayer.x = myData.x; myPlayer.y = myData.y;
-          } else {
-            myPlayer.x += (myData.x - myPlayer.x) * 0.3;
-            myPlayer.y += (myData.y - myPlayer.y) * 0.3;
+        // State transition → snap everything
+        if (ss.state !== this._lastServerState) {
+          this._lastServerState = ss.state;
+          const myD = ss[myKey]; const rmD = ss[rmKey];
+          if (myD) { myPlayer.x = myD.x; myPlayer.y = myD.y; myPlayer.vy = myD.vy; myPlayer.grounded = myD.grounded; }
+          if (rmD) { remotePlayer.x = rmD.x; remotePlayer.y = rmD.y; remotePlayer.vy = rmD.vy; remotePlayer.grounded = rmD.grounded; }
+          if (ss.ball) { this.ball.x = ss.ball.x; this.ball.y = ss.ball.y; this.ball.vx = ss.ball.vx; this.ball.vy = ss.ball.vy; this.ball.rot = ss.ball.rot; this.ball.trail = []; }
+          this._olInterp = null;
+          this._olMyCorr = null;
+          if (ss.state === 3) {
+            this.shake = 8; this.snd.score();
+            this.particles.emit(this.ball.x, GROUND_Y, this.serveSide === 0 ? PAL.p1 : PAL.p2, 8, 4);
           }
-          myPlayer.vy = myData.vy;
-          myPlayer.grounded = myData.grounded;
+          return;
         }
-        if (rmData) {
-          const dxR = Math.abs(remotePlayer.x - rmData.x);
-          const dyR = Math.abs(remotePlayer.y - rmData.y);
-          if (dxR > 15 || dyR > 15) {
-            remotePlayer.x = rmData.x; remotePlayer.y = rmData.y;
-          } else {
-            remotePlayer.x += (rmData.x - remotePlayer.x) * 0.4;
-            remotePlayer.y += (rmData.y - remotePlayer.y) * 0.4;
+
+        // Ball sounds from snapshot velocity changes
+        if (this._olPrevBall && ss.ball) {
+          const pb = this._olPrevBall; const nb = ss.ball;
+          const dvx = Math.abs(nb.vx - pb.vx); const dvy = Math.abs(nb.vy - pb.vy);
+          if (dvx > 0.3 || dvy > 0.5) {
+            if (nb.x < BALL_R + 5 || nb.x > W - BALL_R - 5) this.snd.wall();
+            else if (nb.y < BALL_R + 5 && nb.vy > 0) this.snd.wall();
+            else if (Math.abs(nb.x - NET_X) < 15 && nb.y + BALL_R >= NET_TOP) this.snd.net();
+            else {
+              this.snd.hit();
+              const nearP1 = Math.abs(nb.x - this.p1.hx) + Math.abs(nb.y - this.p1.hy);
+              const nearP2 = Math.abs(nb.x - this.p2.hx) + Math.abs(nb.y - this.p2.hy);
+              const hitP = nearP1 < nearP2 ? this.p1 : this.p2;
+              this.particles.emit(nb.x, nb.y, hitP.color, 4, 3);
+            }
           }
-          remotePlayer.vy = rmData.vy;
-          remotePlayer.grounded = rmData.grounded;
         }
-        if (ss.ball) {
-          const dxB = Math.abs(this.ball.x - ss.ball.x);
-          const dyB = Math.abs(this.ball.y - ss.ball.y);
-          if (dxB > 15 || dyB > 15) {
-            this.ball.x = ss.ball.x; this.ball.y = ss.ball.y;
-            this.ball.vx = ss.ball.vx; this.ball.vy = ss.ball.vy;
+        this._olPrevBall = ss.ball ? { vx: ss.ball.vx, vy: ss.ball.vy, x: ss.ball.x, y: ss.ball.y } : null;
+
+        // Setup interpolation: from current rendered position to server target
+        const rmD = ss[rmKey];
+        const ballD = ss.ball;
+        this._olInterp = {
+          rmFromX: remotePlayer.x, rmFromY: remotePlayer.y,
+          rmToX: rmD ? rmD.x : remotePlayer.x, rmToY: rmD ? rmD.y : remotePlayer.y,
+          rmToVy: rmD ? rmD.vy : 0, rmToGr: rmD ? rmD.grounded : true,
+          ballFromX: this.ball.x, ballFromY: this.ball.y, ballFromRot: this.ball.rot,
+          ballToX: ballD ? ballD.x : this.ball.x, ballToY: ballD ? ballD.y : this.ball.y,
+          ballToVx: ballD ? ballD.vx : 0, ballToVy: ballD ? ballD.vy : 0,
+          ballToRot: ballD ? ballD.rot : this.ball.rot,
+          t: 0,
+        };
+
+        // Local player: spread correction over 2 frames
+        const myD = ss[myKey];
+        if (myD) {
+          const ex = myD.x - myPlayer.x; const ey = myD.y - myPlayer.y;
+          if (Math.abs(ex) > 20 || Math.abs(ey) > 20) {
+            myPlayer.x = myD.x; myPlayer.y = myD.y;
           } else {
-            this.ball.x += (ss.ball.x - this.ball.x) * 0.4;
-            this.ball.y += (ss.ball.y - this.ball.y) * 0.4;
+            this._olMyCorr = { x: ex * 0.4 / 2, y: ey * 0.4 / 2, n: 2 };
           }
-          this.ball.vx = ss.ball.vx;
-          this.ball.vy = ss.ball.vy;
-          this.ball.rot = ss.ball.rot;
+          myPlayer.vy = myD.vy;
+          myPlayer.grounded = myD.grounded;
         }
       }
 
-      // 4. Run local physics for smooth 60fps
-      if (this.state === ST.SERVE) {
-        // During serve, just run movement (no ball)
+      // --- Local player: prediction ---
+      if (this.state === ST.SERVE || this.state === ST.PLAY) {
         myPlayer.update(localInput);
         if (myPlayer.jumped) this.snd.jump();
-        const ri = this._remoteInput || { dx: 0, jump: false };
-        remotePlayer.update(ri);
-        return;
+        if (this._olMyCorr && this._olMyCorr.n > 0) {
+          myPlayer.x += this._olMyCorr.x;
+          myPlayer.y += this._olMyCorr.y;
+          this._olMyCorr.n--;
+        }
       }
 
-      if (this.state !== ST.PLAY) return;
+      // --- Remote player + ball: interpolation / extrapolation ---
+      const ip = this._olInterp;
+      if (ip) {
+        ip.t += 0.5; // reaches 1.0 in 2 frames (30Hz server / 60fps client)
 
-      // Local player
-      myPlayer.update(localInput);
-      if (myPlayer.jumped) this.snd.jump();
+        // Remote player
+        if (ip.t <= 1) {
+          const prevRmX = remotePlayer.x;
+          remotePlayer.x = ip.rmFromX + (ip.rmToX - ip.rmFromX) * ip.t;
+          remotePlayer.y = ip.rmFromY + (ip.rmToY - ip.rmFromY) * ip.t;
+          remotePlayer.grounded = ip.t >= 0.5 ? ip.rmToGr : remotePlayer.grounded;
+          remotePlayer.vy = ip.rmToVy;
+          const d = remotePlayer.x - prevRmX;
+          if (Math.abs(d) > 0.3 && remotePlayer.grounded) remotePlayer.walkT += 0.18;
+          else if (remotePlayer.grounded) remotePlayer.walkT *= 0.85;
+        }
+        // past t=1: hold at target (next snapshot will arrive soon)
 
-      // Remote player — use last known input for prediction
-      const remoteInput = this._remoteInput || { dx: 0, jump: false };
-      remotePlayer.update(remoteInput);
-      if (remotePlayer.jumped) this.snd.jump();
-
-      // Ball physics — run locally for smooth visuals
-      this.ball.update(this.snd);
-      this.ball.hitPlayer(this.p1, this.snd, this.particles);
-      this.ball.hitPlayer(this.p2, this.snd, this.particles);
-
-      // Keep ball in play visually — don't let it fall through ground
-      if (this.ball.y + BALL_R >= GROUND_Y) {
-        this.ball.y = GROUND_Y - BALL_R;
-        this.ball.vy = -Math.abs(this.ball.vy) * 0.3;
+        // Ball
+        if (this.state === ST.PLAY) {
+          if (ip.t <= 1) {
+            this.ball.x = ip.ballFromX + (ip.ballToX - ip.ballFromX) * ip.t;
+            this.ball.y = ip.ballFromY + (ip.ballToY - ip.ballFromY) * ip.t;
+            this.ball.rot = ip.ballFromRot + (ip.ballToRot - ip.ballFromRot) * ip.t;
+            this.ball.vx = ip.ballToVx;
+            this.ball.vy = ip.ballToVy;
+          } else {
+            // Extrapolate using velocity (late snapshot fallback)
+            this.ball.vy += GRAVITY;
+            this.ball.x += this.ball.vx;
+            this.ball.y += this.ball.vy;
+            this.ball.rot += this.ball.vx * 0.06;
+            if (this.ball.x - BALL_R < 0) { this.ball.x = BALL_R; this.ball.vx = Math.abs(this.ball.vx); }
+            if (this.ball.x + BALL_R > W) { this.ball.x = W - BALL_R; this.ball.vx = -Math.abs(this.ball.vx); }
+            if (this.ball.y - BALL_R < 0) { this.ball.y = BALL_R; this.ball.vy = Math.abs(this.ball.vy); }
+          }
+          this.ball.trail.push({ x: this.ball.x, y: this.ball.y });
+          if (this.ball.trail.length > 5) this.ball.trail.shift();
+        }
       }
     }
 
