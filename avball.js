@@ -740,9 +740,8 @@
       this.myElo = 1200;
       this.myRank = null;
       this.opponentName = "";
-      this.lastState = null;
-      this.prevState = null;
-      this.stateTime = 0;
+      this.stateBuffer = [];  // [{state, time}] ring buffer for interpolation
+      this.RENDER_DELAY = 80; // ms behind real-time to smooth jitter
       this.eloResult = null;
       this.onMatchStart = null;
       this.onGameOver = null;
@@ -779,9 +778,12 @@
           try {
             switch (msg.op_code) {
               case OP_STATE:
-                this.prevState = this.lastState;
-                this.lastState = JSON.parse(new TextDecoder().decode(msg.data));
-                this.stateTime = performance.now();
+                this.stateBuffer.push({
+                  s: JSON.parse(new TextDecoder().decode(msg.data)),
+                  t: performance.now()
+                });
+                // Keep last 10 snapshots max
+                if (this.stateBuffer.length > 10) this.stateBuffer.shift();
                 break;
               case OP_SCORE:
                 // handled via state updates
@@ -857,8 +859,7 @@
         try { await this.socket.leaveMatch(this.matchId); } catch (e) {}
         this.matchId = null;
         this.playerSide = -1;
-        this.lastState = null;
-        this.prevState = null;
+        this.stateBuffer = [];
         this.eloResult = null;
       }
     }
@@ -1197,14 +1198,34 @@
       const inp = this.inp.p1();
       this.nk.sendInput(inp.dx, inp.jump);
 
-      // Apply server state
-      const ss = this.nk.lastState;
-      if (!ss) return;
-      const ps = this.nk.prevState;
+      // Apply server state via interpolation buffer
+      const buf = this.nk.stateBuffer;
+      if (buf.length === 0) return;
 
-      // Interpolation factor
-      const elapsed = performance.now() - this.nk.stateTime;
-      const t = Math.min(1, elapsed / 50); // 50ms = 20Hz interval
+      // Render time = now - delay (we render slightly in the past to absorb jitter)
+      const renderTime = performance.now() - this.nk.RENDER_DELAY;
+
+      // Find the two snapshots bracketing renderTime
+      let from = null, to = null;
+      for (let i = buf.length - 1; i >= 1; i--) {
+        if (buf[i - 1].t <= renderTime && buf[i].t >= renderTime) {
+          from = buf[i - 1];
+          to = buf[i];
+          break;
+        }
+      }
+
+      // If renderTime is past all snapshots, just use the latest
+      if (!from || !to) {
+        const latest = buf[buf.length - 1];
+        from = buf.length >= 2 ? buf[buf.length - 2] : latest;
+        to = latest;
+      }
+
+      const ss = to.s;
+      const ps = from.s;
+      const span = to.t - from.t;
+      const t = span > 0 ? Math.min(1, (renderTime - from.t) / span) : 1;
 
       // Map server state to game state
       if (ss.state === 1) this.state = ST.SERVE;
@@ -1224,7 +1245,6 @@
 
       // Local player: client-side prediction + reconciliation
       myPlayer.update(inp);
-      // Reconcile with server
       const serverMe = ss[myKey];
       if (serverMe) {
         const dx = Math.abs(myPlayer.x - serverMe.x);
@@ -1240,36 +1260,33 @@
         myPlayer.grounded = serverMe.grounded;
       }
 
-      // Remote player: interpolate
-      const serverRemote = ss[remoteKey];
-      if (serverRemote) {
-        if (ps && ps[remoteKey]) {
-          remotePlayer.x = ps[remoteKey].x + (serverRemote.x - ps[remoteKey].x) * t;
-          remotePlayer.y = ps[remoteKey].y + (serverRemote.y - ps[remoteKey].y) * t;
+      // Remote player: interpolate between two snapshots
+      const sr = ss[remoteKey], pr = ps[remoteKey];
+      if (sr) {
+        if (pr) {
+          remotePlayer.x = pr.x + (sr.x - pr.x) * t;
+          remotePlayer.y = pr.y + (sr.y - pr.y) * t;
         } else {
-          remotePlayer.x = serverRemote.x;
-          remotePlayer.y = serverRemote.y;
+          remotePlayer.x = sr.x;
+          remotePlayer.y = sr.y;
         }
-        remotePlayer.vy = serverRemote.vy;
-        remotePlayer.grounded = serverRemote.grounded;
+        remotePlayer.vy = sr.vy;
+        remotePlayer.grounded = sr.grounded;
       }
 
-      // Ball: interpolate from server
+      // Ball: interpolate between two snapshots
       if (ss.ball) {
-        if (ps && ps.ball) {
+        if (ps.ball) {
           this.ball.x = ps.ball.x + (ss.ball.x - ps.ball.x) * t;
           this.ball.y = ps.ball.y + (ss.ball.y - ps.ball.y) * t;
-          this.ball.vx = ss.ball.vx;
-          this.ball.vy = ss.ball.vy;
           this.ball.rot = ps.ball.rot + (ss.ball.rot - ps.ball.rot) * t;
         } else {
           this.ball.x = ss.ball.x;
           this.ball.y = ss.ball.y;
-          this.ball.vx = ss.ball.vx;
-          this.ball.vy = ss.ball.vy;
           this.ball.rot = ss.ball.rot;
         }
-        // Update trail for rendering
+        this.ball.vx = ss.ball.vx;
+        this.ball.vy = ss.ball.vy;
         this.ball.trail.push({ x: this.ball.x, y: this.ball.y });
         if (this.ball.trail.length > 5) this.ball.trail.shift();
       }
