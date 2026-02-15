@@ -754,8 +754,9 @@
         // Dynamic import — no separate module script needed
         const nakamajs = await import('/static/nakama-js.esm.mjs?v=2');
         this.client = new nakamajs.Client(NAKAMA_KEY, NAKAMA_HOST, NAKAMA_PORT, NAKAMA_SSL);
-        // Route through Caddy /nakama/ path
-        this.client.basePath = "/nakama";
+        // Route API calls through Caddy /nakama/ prefix
+        const scheme = NAKAMA_SSL ? "https://" : "http://";
+        this.client.apiClient.basePath = `${scheme}${NAKAMA_HOST}:${NAKAMA_PORT}/nakama`;
 
         let deviceId = localStorage.getItem("avball_did");
         if (!deviceId) {
