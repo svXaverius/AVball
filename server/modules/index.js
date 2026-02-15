@@ -247,7 +247,7 @@ var ST_SERVE = 1;
 var ST_PLAY = 2;
 var ST_SCORED = 3;
 var ST_OVER = 4;
-var BROADCAST_INTERVAL = 3; // 20Hz at 60 tick rate
+var BROADCAST_INTERVAL = 2; // 30Hz at 60 tick rate
 var SERVE_TIMER = 50;
 var SCORED_TIMER = 55;
 // ============================================================
