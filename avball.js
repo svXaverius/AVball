@@ -774,28 +774,32 @@
         await this.socket.connect(this.session, false);
 
         this.socket.onmatchdata = (msg) => {
-          switch (msg.op_code) {
-            case OP_STATE:
-              this.prevState = this.lastState;
-              this.lastState = JSON.parse(new TextDecoder().decode(msg.data));
-              this.stateTime = performance.now();
-              break;
-            case OP_SCORE:
-              // handled via state updates
-              break;
-            case OP_GAME_OVER: {
-              const result = JSON.parse(new TextDecoder().decode(msg.data));
-              this.eloResult = result.elo;
-              if (this.onGameOver) this.onGameOver(result);
-              break;
+          try {
+            switch (msg.op_code) {
+              case OP_STATE:
+                this.prevState = this.lastState;
+                this.lastState = JSON.parse(new TextDecoder().decode(msg.data));
+                this.stateTime = performance.now();
+                break;
+              case OP_SCORE:
+                // handled via state updates
+                break;
+              case OP_GAME_OVER: {
+                const result = JSON.parse(new TextDecoder().decode(msg.data));
+                this.eloResult = result.elo || null;
+                if (this.onGameOver) this.onGameOver(result);
+                break;
+              }
+              case OP_SIDE_ASSIGN: {
+                const info = JSON.parse(new TextDecoder().decode(msg.data));
+                this.playerSide = info.side;
+                this.opponentName = String(info.opponent || "");
+                if (this.onMatchStart) this.onMatchStart(info);
+                break;
+              }
             }
-            case OP_SIDE_ASSIGN: {
-              const info = JSON.parse(new TextDecoder().decode(msg.data));
-              this.playerSide = info.side;
-              this.opponentName = info.opponent || "";
-              if (this.onMatchStart) this.onMatchStart(info);
-              break;
-            }
+          } catch (e) {
+            console.warn("Bad match data:", e);
           }
         };
 
@@ -806,6 +810,7 @@
 
         this.socket.ondisconnect = () => {
           this.connected = false;
+          this.ready = false;
         };
 
         this.connected = true;
@@ -1181,6 +1186,11 @@
     }
 
     uOnline() {
+      // If disconnected, return to menu
+      if (!this.nk.connected) {
+        this.state = ST.MENU;
+        return;
+      }
       // Send local input to server
       const inp = this.inp.p1();
       this.nk.sendInput(inp.dx, inp.jump);

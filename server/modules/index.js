@@ -155,11 +155,13 @@ function ballHitPlayer(ball, p) {
 var ELO_K = 32;
 var DEFAULT_ELO = 1200;
 var LEADERBOARD_ID = 'elo_ratings';
+var ELO_MIN = 0;
+var ELO_MAX = 5000;
 function calculateElo(winnerElo, loserElo) {
     var expectedW = 1 / (1 + Math.pow(10, (loserElo - winnerElo) / 400));
     var expectedL = 1 - expectedW;
-    var newWinner = Math.round(winnerElo + ELO_K * (1 - expectedW));
-    var newLoser = Math.round(loserElo + ELO_K * (0 - expectedL));
+    var newWinner = Math.max(ELO_MIN, Math.min(ELO_MAX, Math.round(winnerElo + ELO_K * (1 - expectedW))));
+    var newLoser = Math.max(ELO_MIN, Math.min(ELO_MAX, Math.round(loserElo + ELO_K * (0 - expectedL))));
     return {
         newWinner: newWinner,
         newLoser: newLoser,
@@ -178,6 +180,8 @@ function setElo(nk, userId, username, elo) {
     nk.leaderboardRecordWrite(LEADERBOARD_ID, userId, username, elo, 0);
 }
 function updateEloAfterMatch(nk, winnerId, winnerName, loserId, loserName) {
+    if (!winnerId || !loserId)
+        return null;
     var winnerElo = getElo(nk, winnerId);
     var loserElo = getElo(nk, loserId);
     var result = calculateElo(winnerElo, loserElo);
@@ -188,7 +192,6 @@ function updateEloAfterMatch(nk, winnerId, winnerName, loserId, loserName) {
 // ============================================================
 // AI (port from avball.js AI class)
 // ============================================================
-var AI_DEVICE_ID = 'avball-cpu-bot-device';
 var AI_USERNAME = 'CPU';
 var AI_USER_ID = ''; // set at init time
 function aiUpdate(state, me, ball) {
@@ -275,7 +278,24 @@ function rpcGetPlayerElo(ctx, logger, nk, payload) {
     }
     return JSON.stringify({ elo: DEFAULT_ELO, rank: null });
 }
+var MATCH_CREATE_COOLDOWN_SEC = 5;
 function rpcCreateAiMatch(ctx, logger, nk, payload) {
+    var userId = ctx.userId;
+    if (!userId)
+        throw Error('authentication required');
+    // Rate limit via Nakama storage
+    var now = Math.floor(Date.now() / 1000);
+    var stored = nk.storageRead([{ collection: 'rate_limit', key: 'ai_match', userId: userId }]);
+    if (stored.length > 0 && stored[0].value && stored[0].value['ts']) {
+        var lastTs = stored[0].value['ts'];
+        if (now - lastTs < MATCH_CREATE_COOLDOWN_SEC) {
+            throw Error('rate limited: wait ' + (MATCH_CREATE_COOLDOWN_SEC - (now - lastTs)) + 's');
+        }
+    }
+    nk.storageWrite([{
+            collection: 'rate_limit', key: 'ai_match', userId: userId,
+            value: { ts: now }, permissionRead: 0, permissionWrite: 0,
+        }]);
     var matchId = nk.matchCreate('avball', { ai: 'true' });
     return JSON.stringify({ matchId: matchId });
 }
@@ -386,14 +406,26 @@ var matchLeave = function (ctx, logger, nk, dispatcher, tick, state, presences) 
     if (s.gameState >= ST_SERVE && s.gameState <= ST_SCORED) {
         var winnerId = remaining[0];
         var loserId = presences[0].userId;
-        if (s.usernames[loserId] && s.usernames[winnerId]) {
+        // Don't award ELO on forfeit for AI matches (prevents farming)
+        // For PvP forfeits, require at least 3 total points scored
+        var totalScore = s.score[0] + s.score[1];
+        var awardElo = !s.isAiMatch && totalScore >= 3 && winnerId && loserId;
+        var remainingPresences = remaining.map(function (k) { return s.presences[k]; });
+        if (awardElo && s.usernames[loserId] && s.usernames[winnerId]) {
             var eloResult = updateEloAfterMatch(nk, winnerId, s.usernames[winnerId], loserId, s.usernames[loserId]);
-            var remainingPresences = remaining.map(function (k) { return s.presences[k]; });
             dispatcher.broadcastMessage(OP_GAME_OVER, JSON.stringify({
                 winner: s.playerSides[winnerId],
                 score: s.score,
                 forfeit: true,
-                elo: { delta: eloResult.deltaWinner, newElo: eloResult.newWinner },
+                elo: eloResult ? { delta: eloResult.deltaWinner, newElo: eloResult.newWinner } : null,
+            }), remainingPresences);
+        }
+        else {
+            dispatcher.broadcastMessage(OP_GAME_OVER, JSON.stringify({
+                winner: s.playerSides[winnerId],
+                score: s.score,
+                forfeit: true,
+                elo: null,
             }), remainingPresences);
         }
         return null;
@@ -409,6 +441,11 @@ var matchLoop = function (ctx, logger, nk, dispatcher, tick, state, messages) {
     for (var i = 0; i < messages.length; i++) {
         var msg = messages[i];
         if (msg.opCode === OP_INPUT) {
+            // Fix #5: only accept input from match participants
+            if (!(msg.sender.userId in s.playerSides)) {
+                logger.warn('Input from non-participant: %s', msg.sender.userId);
+                continue;
+            }
             try {
                 var data = JSON.parse(nk.binaryToString(msg.data));
                 var dx = Math.max(-1, Math.min(1, Math.round(data.dx || 0)));
@@ -416,7 +453,7 @@ var matchLoop = function (ctx, logger, nk, dispatcher, tick, state, messages) {
                 s.inputs[msg.sender.userId] = { dx: dx, jump: jump };
             }
             catch (e) {
-                // ignore malformed
+                logger.warn('Malformed input from %s', msg.sender.userId);
             }
         }
     }
@@ -487,14 +524,15 @@ var matchLoop = function (ctx, logger, nk, dispatcher, tick, state, messages) {
                 for (var pi = 0; pi < ap.length; pi++) {
                     var pSide = s.playerSides[ap[pi].userId];
                     var isWin = pSide === winSide;
+                    var eloPayload = eloRes ? {
+                        delta: isWin ? eloRes.deltaWinner : eloRes.deltaLoser,
+                        newElo: isWin ? eloRes.newWinner : eloRes.newLoser,
+                    } : null;
                     dispatcher.broadcastMessage(OP_GAME_OVER, JSON.stringify({
                         winner: winSide,
                         score: s.score,
                         forfeit: false,
-                        elo: {
-                            delta: isWin ? eloRes.deltaWinner : eloRes.deltaLoser,
-                            newElo: isWin ? eloRes.newWinner : eloRes.newLoser,
-                        },
+                        elo: eloPayload,
                     }), [ap[pi]]);
                 }
             }
@@ -565,9 +603,40 @@ var InitModule = function (ctx, logger, nk, initializer) {
         logger.debug('Leaderboard already exists');
     }
     // Ensure CPU bot user exists
+    // Look up by username first, then create with non-guessable device ID if needed
     try {
-        var aiUsers = nk.authenticateDevice(AI_DEVICE_ID, AI_USERNAME, true);
-        AI_USER_ID = aiUsers.userId;
+        var cpuUsers = nk.usersGetUsername([AI_USERNAME]);
+        if (cpuUsers.length > 0) {
+            AI_USER_ID = cpuUsers[0].userId;
+            // Unlink the old guessable device ID and link a new one
+            try {
+                nk.unlinkDevice(AI_USER_ID, 'avball-cpu-bot-device');
+            }
+            catch (e) { }
+            var SYSTEM_USER_ID = '00000000-0000-0000-0000-000000000000';
+            var stored = nk.storageRead([{ collection: 'system', key: 'cpu_bot', userId: SYSTEM_USER_ID }]);
+            if (stored.length === 0 || !stored[0].value || !stored[0].value['deviceId']) {
+                var newDeviceId = 'cpu-' + nk.uuidv4();
+                nk.storageWrite([{
+                        collection: 'system', key: 'cpu_bot', userId: SYSTEM_USER_ID,
+                        value: { deviceId: newDeviceId }, permissionRead: 0, permissionWrite: 0,
+                    }]);
+                try {
+                    nk.linkDevice(AI_USER_ID, newDeviceId);
+                }
+                catch (e) { }
+            }
+        }
+        else {
+            var cpuDeviceId = 'cpu-' + nk.uuidv4();
+            var SYSTEM_USER_ID2 = '00000000-0000-0000-0000-000000000000';
+            nk.storageWrite([{
+                    collection: 'system', key: 'cpu_bot', userId: SYSTEM_USER_ID2,
+                    value: { deviceId: cpuDeviceId }, permissionRead: 0, permissionWrite: 0,
+                }]);
+            var aiUsers = nk.authenticateDevice(cpuDeviceId, AI_USERNAME, true);
+            AI_USER_ID = aiUsers.userId;
+        }
         setElo(nk, AI_USER_ID, AI_USERNAME, DEFAULT_ELO);
         logger.info('CPU bot ready: %s', AI_USER_ID);
     }
