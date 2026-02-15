@@ -1188,13 +1188,19 @@
         this.state = ST.MENU;
         return;
       }
-      // Send local input to server
+      // Send local input to server at 20Hz (every 3rd frame), skip in AI matches
       const inp = this.inp.p1();
-      this.nk.sendInput(inp.dx, inp.jump);
+      if (this.mode === 3 && this.frame % 3 === 0) {
+        this.nk.sendInput(inp.dx, inp.jump);
+      }
 
-      // Apply latest server state with smoothing
+      // Apply latest server state
       const ss = this.nk.serverState;
       if (!ss) return;
+
+      // Only update visuals when we get a NEW server snapshot
+      if (ss === this._lastApplied) return;
+      this._lastApplied = ss;
 
       // Map server state to game state
       if (ss.state === 1) this.state = ST.SERVE;
@@ -1211,34 +1217,29 @@
       const myPlayer = mySide === 0 ? this.p1 : this.p2;
       const remotePlayer = mySide === 0 ? this.p2 : this.p1;
 
-      // Smoothing factor: 0.35 = fast convergence, no jitter
-      const S = 0.35;
-
-      // Local player: lerp toward server position
+      // Snap all positions directly from server — clean 30fps retro look
       const me = ss[myKey];
       if (me) {
-        myPlayer.x += (me.x - myPlayer.x) * S;
-        myPlayer.y += (me.y - myPlayer.y) * S;
+        myPlayer.x = me.x;
+        myPlayer.y = me.y;
         myPlayer.vy = me.vy;
         myPlayer.grounded = me.grounded;
       }
 
-      // Remote player: lerp toward server position
       const rm = ss[remoteKey];
       if (rm) {
-        remotePlayer.x += (rm.x - remotePlayer.x) * S;
-        remotePlayer.y += (rm.y - remotePlayer.y) * S;
+        remotePlayer.x = rm.x;
+        remotePlayer.y = rm.y;
         remotePlayer.vy = rm.vy;
         remotePlayer.grounded = rm.grounded;
       }
 
-      // Ball: lerp toward server position
       if (ss.ball) {
-        this.ball.x += (ss.ball.x - this.ball.x) * S;
-        this.ball.y += (ss.ball.y - this.ball.y) * S;
+        this.ball.x = ss.ball.x;
+        this.ball.y = ss.ball.y;
         this.ball.vx = ss.ball.vx;
         this.ball.vy = ss.ball.vy;
-        this.ball.rot += (ss.ball.rot - this.ball.rot) * S;
+        this.ball.rot = ss.ball.rot;
         this.ball.trail.push({ x: this.ball.x, y: this.ball.y });
         if (this.ball.trail.length > 5) this.ball.trail.shift();
       }
