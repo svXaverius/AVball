@@ -1256,29 +1256,21 @@
           t: 0,
         };
 
-        // Local player: spread correction over 2 frames
+        // Local player: trust local physics, only snap on major desync
         const myD = ss[myKey];
         if (myD) {
-          const ex = myD.x - myPlayer.x; const ey = myD.y - myPlayer.y;
-          if (Math.abs(ex) > 20 || Math.abs(ey) > 20) {
+          const ex = Math.abs(myD.x - myPlayer.x); const ey = Math.abs(myD.y - myPlayer.y);
+          if (ex > 50 || ey > 50) {
             myPlayer.x = myD.x; myPlayer.y = myD.y;
-          } else {
-            this._olMyCorr = { x: ex * 0.4 / 2, y: ey * 0.4 / 2, n: 2 };
+            myPlayer.vy = myD.vy; myPlayer.grounded = myD.grounded;
           }
-          myPlayer.vy = myD.vy;
-          myPlayer.grounded = myD.grounded;
         }
       }
 
-      // --- Local player: prediction ---
+      // --- Local player: pure local prediction (no server corrections) ---
       if (this.state === ST.SERVE || this.state === ST.PLAY) {
         myPlayer.update(localInput);
         if (myPlayer.jumped) this.snd.jump();
-        if (this._olMyCorr && this._olMyCorr.n > 0) {
-          myPlayer.x += this._olMyCorr.x;
-          myPlayer.y += this._olMyCorr.y;
-          this._olMyCorr.n--;
-        }
       }
 
       // --- Remote player + ball: interpolation / extrapolation ---
