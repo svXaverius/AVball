@@ -1,0 +1,13 @@
+{
+  "name": "avball-nakama",
+  "private": true,
+  "scripts": {
+    "build": "npx tsc && cp build/index.js modules/index.js"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "nakama-common": "github:heroiclabs/nakama-common"
+  }
+}

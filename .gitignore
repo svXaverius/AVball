@@ -12,3 +12,8 @@ Desktop.ini
 
 # Node (if someone adds tooling)
 node_modules/
+
+# Nakama server
+server/.env
+server/data/
+server/node_modules/

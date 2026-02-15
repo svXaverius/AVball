@@ -1,0 +1,55 @@
+version: '3'
+services:
+  postgres:
+    container_name: nakama-postgres
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_DB=nakama
+      - POSTGRES_USER=nakama
+      - POSTGRES_PASSWORD=localdb
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    expose:
+      - "5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "nakama", "-d", "nakama"]
+      interval: 3s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  nakama:
+    container_name: nakama
+    image: registry.heroiclabs.com/heroiclabs/nakama:3.25.0
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint:
+      - /bin/sh
+      - -ecx
+      - >
+        /nakama/nakama migrate up
+        --database.address nakama:localdb@postgres:5432/nakama &&
+        exec /nakama/nakama
+        --name nakama1
+        --database.address nakama:localdb@postgres:5432/nakama
+        --logger.level INFO
+        --session.token_expiry_sec 7200
+        --socket.server_key "defaultkey"
+        --runtime.js_entrypoint "index.js"
+        --console.username "${NAKAMA_CONSOLE_USER}"
+        --console.password "${NAKAMA_CONSOLE_PASS}"
+    ports:
+      - "127.0.0.1:7350:7350"
+      - "127.0.0.1:7351:7351"
+    volumes:
+      - ./modules:/nakama/data/modules
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/nakama/nakama", "healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:
