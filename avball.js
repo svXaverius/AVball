@@ -756,7 +756,7 @@
       }
       if (!window.nakamajs) return;
       try {
-        this.client = new nakamajs.Client(NAKAMA_KEY, NAKAMA_HOST, NAKAMA_PORT, NAKAMA_SSL);
+        this.client = new window.nakamajs.Client(NAKAMA_KEY, NAKAMA_HOST, NAKAMA_PORT, NAKAMA_SSL);
         // Route through Caddy /nakama/ path
         this.client.basePath = "/nakama";
 
