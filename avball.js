@@ -1213,9 +1213,11 @@
           const myD = ss[myKey]; const rmD = ss[rmKey];
           if (myD) { myPlayer.x = myD.x; myPlayer.y = myD.y; myPlayer.vy = myD.vy; myPlayer.grounded = myD.grounded; }
           if (rmD) { remotePlayer.x = rmD.x; remotePlayer.y = rmD.y; remotePlayer.vy = rmD.vy; remotePlayer.grounded = rmD.grounded; }
-          if (ss.ball) { this.ball.x = ss.ball.x; this.ball.y = ss.ball.y; this.ball.vx = ss.ball.vx; this.ball.vy = ss.ball.vy; this.ball.rot = ss.ball.rot; this.ball.trail = []; }
+          if (ss.ball) {
+            this.ball.x = ss.ball.x; this.ball.y = ss.ball.y; this.ball.vx = ss.ball.vx; this.ball.vy = ss.ball.vy; this.ball.rot = ss.ball.rot; this.ball.trail = [];
+            this._ballLocal = mySide === 0 ? ss.ball.x < NET_X : ss.ball.x >= NET_X;
+          }
           this._olInterp = null;
-          this._olMyCorr = null;
           if (ss.state === 3) {
             this.shake = 8; this.snd.score();
             this.particles.emit(this.ball.x, GROUND_Y, this.serveSide === 0 ? PAL.p1 : PAL.p2, 8, 4);
@@ -1223,8 +1225,20 @@
           return;
         }
 
-        // Ball sounds from snapshot velocity changes
-        if (this._olPrevBall && ss.ball) {
+        // Determine ball ownership: server says which side the ball is on
+        if (ss.ball) {
+          const wasLocal = this._ballLocal;
+          this._ballLocal = mySide === 0 ? ss.ball.x < NET_X : ss.ball.x >= NET_X;
+          // Ball just arrived on my side → snap to server for accurate local physics start
+          if (this._ballLocal && !wasLocal) {
+            this.ball.x = ss.ball.x; this.ball.y = ss.ball.y;
+            this.ball.vx = ss.ball.vx; this.ball.vy = ss.ball.vy;
+            this.ball.rot = ss.ball.rot;
+          }
+        }
+
+        // Ball sounds from snapshots (only when ball is on REMOTE side)
+        if (!this._ballLocal && this._olPrevBall && ss.ball) {
           const pb = this._olPrevBall; const nb = ss.ball;
           const dvx = Math.abs(nb.vx - pb.vx); const dvy = Math.abs(nb.vy - pb.vy);
           if (dvx > 0.3 || dvy > 0.5) {
@@ -1242,19 +1256,21 @@
         }
         this._olPrevBall = ss.ball ? { vx: ss.ball.vx, vy: ss.ball.vy, x: ss.ball.x, y: ss.ball.y } : null;
 
-        // Setup interpolation: from current rendered position to server target
+        // Setup interpolation for remote player (always) and ball (only when on remote side)
         const rmD = ss[rmKey];
-        const ballD = ss.ball;
         this._olInterp = {
           rmFromX: remotePlayer.x, rmFromY: remotePlayer.y,
           rmToX: rmD ? rmD.x : remotePlayer.x, rmToY: rmD ? rmD.y : remotePlayer.y,
           rmToVy: rmD ? rmD.vy : 0, rmToGr: rmD ? rmD.grounded : true,
-          ballFromX: this.ball.x, ballFromY: this.ball.y, ballFromRot: this.ball.rot,
-          ballToX: ballD ? ballD.x : this.ball.x, ballToY: ballD ? ballD.y : this.ball.y,
-          ballToVx: ballD ? ballD.vx : 0, ballToVy: ballD ? ballD.vy : 0,
-          ballToRot: ballD ? ballD.rot : this.ball.rot,
           t: 0,
         };
+        if (!this._ballLocal && ss.ball) {
+          this._olInterp.ballFromX = this.ball.x; this._olInterp.ballFromY = this.ball.y; this._olInterp.ballFromRot = this.ball.rot;
+          this._olInterp.ballToX = ss.ball.x; this._olInterp.ballToY = ss.ball.y;
+          this._olInterp.ballToVx = ss.ball.vx; this._olInterp.ballToVy = ss.ball.vy;
+          this._olInterp.ballToRot = ss.ball.rot;
+          this._olInterp.hasBall = true;
+        }
 
         // Local player: trust local physics, only snap on major desync
         const myD = ss[myKey];
@@ -1267,18 +1283,16 @@
         }
       }
 
-      // --- Local player: pure local prediction (no server corrections) ---
+      // --- Local player: pure local prediction ---
       if (this.state === ST.SERVE || this.state === ST.PLAY) {
         myPlayer.update(localInput);
         if (myPlayer.jumped) this.snd.jump();
       }
 
-      // --- Remote player + ball: interpolation / extrapolation ---
+      // --- Remote player: interpolation ---
       const ip = this._olInterp;
       if (ip) {
-        ip.t += 0.5; // reaches 1.0 in 2 frames (30Hz server / 60fps client)
-
-        // Remote player
+        ip.t += 0.5;
         if (ip.t <= 1) {
           const prevRmX = remotePlayer.x;
           remotePlayer.x = ip.rmFromX + (ip.rmToX - ip.rmFromX) * ip.t;
@@ -1289,10 +1303,21 @@
           if (Math.abs(d) > 0.3 && remotePlayer.grounded) remotePlayer.walkT += 0.18;
           else if (remotePlayer.grounded) remotePlayer.walkT *= 0.85;
         }
-        // past t=1: hold at target (next snapshot will arrive soon)
+      }
 
-        // Ball
-        if (this.state === ST.PLAY) {
+      // --- Ball ---
+      if (this.state === ST.PLAY) {
+        if (this._ballLocal) {
+          // Ball on my side → local physics (instant response)
+          this.ball.update(this.snd);
+          this.ball.hitPlayer(myPlayer, this.snd, this.particles);
+          // Don't score locally — server is authoritative
+          if (this.ball.y + BALL_R >= GROUND_Y) {
+            this.ball.y = GROUND_Y - BALL_R;
+            this.ball.vy = 0;
+          }
+        } else if (ip && ip.hasBall) {
+          // Ball on remote side → interpolation from server
           if (ip.t <= 1) {
             this.ball.x = ip.ballFromX + (ip.ballToX - ip.ballFromX) * ip.t;
             this.ball.y = ip.ballFromY + (ip.ballToY - ip.ballFromY) * ip.t;
