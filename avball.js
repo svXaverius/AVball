@@ -42,7 +42,17 @@
     mid: "#888888",
   };
 
-  const ST = { MENU: 0, SERVE: 1, PLAY: 2, SCORED: 3, OVER: 4 };
+  const ST = {
+    MENU: 0,
+    SERVE: 1,
+    PLAY: 2,
+    SCORED: 3,
+    OVER: 4,
+    ONLINE_WAIT: 5,
+    ONLINE_PLAY: 6,
+    ONLINE_SCORED: 7,
+    ONLINE_OVER: 8,
+  };
 
   // ============================================================
   // SOUND ENGINE
@@ -704,6 +714,168 @@
   }
 
   // ============================================================
+  // NAKAMA CLIENT
+  // ============================================================
+  const NAKAMA_KEY = "defaultkey"; // server socket key (not secret - app identifier)
+  const NAKAMA_HOST = location.hostname;
+  const NAKAMA_PORT = location.port || "443";
+  const NAKAMA_SSL = location.protocol === "https:";
+
+  const OP_INPUT = 1;
+  const OP_STATE = 2;
+  const OP_SCORE = 3;
+  const OP_GAME_OVER = 4;
+  const OP_SIDE_ASSIGN = 5;
+
+  class NakamaClient {
+    constructor() {
+      this.client = null;
+      this.session = null;
+      this.socket = null;
+      this.matchId = null;
+      this.playerSide = -1;
+      this.connected = false;
+      this.ready = false;
+      this.leaderboard = [];
+      this.myElo = 1200;
+      this.myRank = null;
+      this.opponentName = "";
+      this.lastState = null;
+      this.prevState = null;
+      this.stateTime = 0;
+      this.eloResult = null;
+      this.onMatchStart = null;
+      this.onGameOver = null;
+      this.matchTicket = null;
+    }
+
+    async init() {
+      if (!window.nakamajs) return;
+      try {
+        this.client = new nakamajs.Client(NAKAMA_KEY, NAKAMA_HOST, NAKAMA_PORT, NAKAMA_SSL);
+        // Route through Caddy /nakama/ path
+        this.client.basePath = "/nakama";
+
+        let deviceId = localStorage.getItem("avball_did");
+        if (!deviceId) {
+          deviceId = crypto.randomUUID();
+          localStorage.setItem("avball_did", deviceId);
+        }
+
+        this.session = await this.client.authenticateDevice(deviceId, true);
+
+        this.socket = this.client.createSocket(NAKAMA_SSL, false);
+        // Patch WebSocket adapter to route through Caddy /nakama/ prefix
+        const origConnect = this.socket.adapter.connect.bind(this.socket.adapter);
+        this.socket.adapter.connect = (scheme, host, port, createStatus, token) => {
+          const url = `${scheme}${host}:${port}/nakama/ws?lang=en&status=${encodeURIComponent(createStatus.toString())}&token=${encodeURIComponent(token)}`;
+          this.socket.adapter._socket = new WebSocket(url);
+        };
+        await this.socket.connect(this.session, false);
+
+        this.socket.onmatchdata = (msg) => {
+          switch (msg.op_code) {
+            case OP_STATE:
+              this.prevState = this.lastState;
+              this.lastState = JSON.parse(new TextDecoder().decode(msg.data));
+              this.stateTime = performance.now();
+              break;
+            case OP_SCORE:
+              // handled via state updates
+              break;
+            case OP_GAME_OVER: {
+              const result = JSON.parse(new TextDecoder().decode(msg.data));
+              this.eloResult = result.elo;
+              if (this.onGameOver) this.onGameOver(result);
+              break;
+            }
+            case OP_SIDE_ASSIGN: {
+              const info = JSON.parse(new TextDecoder().decode(msg.data));
+              this.playerSide = info.side;
+              this.opponentName = info.opponent || "";
+              if (this.onMatchStart) this.onMatchStart(info);
+              break;
+            }
+          }
+        };
+
+        this.socket.onmatchmakermatched = async (matched) => {
+          this.matchId = matched.match_id;
+          await this.socket.joinMatch(matched.match_id, matched.token);
+        };
+
+        this.socket.ondisconnect = () => {
+          this.connected = false;
+        };
+
+        this.connected = true;
+        await this.fetchLeaderboard();
+        await this.fetchMyElo();
+        this.ready = true;
+      } catch (e) {
+        console.warn("Nakama init failed:", e);
+        this.ready = false;
+      }
+    }
+
+    async findMatch() {
+      if (!this.socket) return;
+      this.matchTicket = await this.socket.addMatchmaker("*", 2, 2);
+    }
+
+    async cancelSearch() {
+      if (this.matchTicket && this.socket) {
+        try {
+          await this.socket.removeMatchmaker(this.matchTicket.ticket);
+        } catch (e) {}
+        this.matchTicket = null;
+      }
+    }
+
+    async startAiMatch() {
+      if (!this.client || !this.session || !this.socket) return;
+      const res = await this.client.rpc(this.session, "create_ai_match", "");
+      const data = res.payload;
+      this.matchId = data.matchId;
+      await this.socket.joinMatch(this.matchId);
+    }
+
+    sendInput(dx, jump) {
+      if (!this.matchId || !this.socket) return;
+      this.socket.sendMatchState(this.matchId, OP_INPUT, JSON.stringify({ dx: dx, jump: jump }));
+    }
+
+    async leaveMatch() {
+      if (this.matchId && this.socket) {
+        try { await this.socket.leaveMatch(this.matchId); } catch (e) {}
+        this.matchId = null;
+        this.playerSide = -1;
+        this.lastState = null;
+        this.prevState = null;
+        this.eloResult = null;
+      }
+    }
+
+    async fetchLeaderboard() {
+      if (!this.client || !this.session) return;
+      try {
+        const res = await this.client.rpc(this.session, "get_leaderboard", "");
+        this.leaderboard = res.payload;
+      } catch (e) {}
+    }
+
+    async fetchMyElo() {
+      if (!this.client || !this.session) return;
+      try {
+        const res = await this.client.rpc(this.session, "get_player_elo", "");
+        const data = res.payload;
+        this.myElo = data.elo;
+        this.myRank = data.rank;
+      } catch (e) {}
+    }
+  }
+
+  // ============================================================
   // GAME
   // ============================================================
   class Game {
@@ -721,13 +893,30 @@
       this.particles = new Particles();
 
       this.state = ST.MENU;
-      this.mode = 0; // 0=1P, 1=2P
+      this.mode = 0; // 0=1P_LOCAL, 1=2P_LOCAL, 2=1P_ONLINE, 3=2P_ONLINE
       this.menuSel = 0;
 
       this.p1 = new Player(W * 0.25, 0, PAL.p1, PAL.p1d);
       this.p2 = new Player(W * 0.75, 1, PAL.p2, PAL.p2d);
       this.ball = new Ball();
       this.ai = new AI();
+
+      // Nakama online — set callbacks before init so they're in place for socket events
+      this.nk = new NakamaClient();
+      this.nk.onMatchStart = (info) => {
+        this.state = ST.SERVE;
+        this.score = [0, 0];
+        this.p1.reset();
+        this.p2.reset();
+        this.particles.list = [];
+        this.snd.init();
+        this.snd.menu();
+      };
+      this.nk.onGameOver = (result) => {
+        this.state = ST.ONLINE_OVER;
+        this.snd.win();
+      };
+      this.nk.init().catch(() => {});
 
       this.score = [0, 0];
       this.serveSide = 0;
@@ -797,14 +986,53 @@
       this.snd.menu();
     }
 
+    startOnlineAI() {
+      this.mode = 2;
+      this.score = [0, 0];
+      this.p1.reset();
+      this.p2.reset();
+      this.particles.list = [];
+      this.ball.trail = [];
+      this.snd.init();
+      this.snd.menu();
+      this.nk.startAiMatch().catch(() => {});
+      this.state = ST.ONLINE_WAIT;
+    }
+
+    startOnlinePvP() {
+      this.mode = 3;
+      this.score = [0, 0];
+      this.p1.reset();
+      this.p2.reset();
+      this.particles.list = [];
+      this.ball.trail = [];
+      this.snd.init();
+      this.snd.menu();
+      this.nk.findMatch().catch(() => {});
+      this.state = ST.ONLINE_WAIT;
+    }
+
     update() {
       this.frame++;
       this.particles.update();
       if (this.shake > 0) this.shake--;
 
+      // Online modes — server is authoritative for SERVE/PLAY/SCORED states
+      if (this.mode >= 2 && this.state >= ST.SERVE && this.state <= ST.SCORED) {
+        this.uOnline();
+        return;
+      }
+
       switch (this.state) {
         case ST.MENU:
           this.uMenu();
+          break;
+        case ST.ONLINE_WAIT:
+          if (this.inp.keys["Escape"]) {
+            this.nk.cancelSearch();
+            this.state = ST.MENU;
+            this.inp.keys["Escape"] = false;
+          }
           break;
         case ST.SERVE:
           this.timer--;
@@ -838,12 +1066,16 @@
         case ST.OVER:
           this.uOver();
           break;
+        case ST.ONLINE_OVER:
+          this.uOnlineOver();
+          break;
       }
     }
 
     uMenu() {
       if (this.inp.keys["Digit1"]) {
-        this.startGame(0);
+        if (this.nk.ready) this.startOnlineAI();
+        else this.startGame(0);
         this.inp.keys["Digit1"] = false;
         return;
       }
@@ -852,21 +1084,33 @@
         this.inp.keys["Digit2"] = false;
         return;
       }
+      if (this.inp.keys["Digit3"] && this.nk.ready) {
+        this.startOnlinePvP();
+        this.inp.keys["Digit3"] = false;
+        return;
+      }
       if (this.inp.keys["Enter"] || this.inp.keys["Space"]) {
-        this.startGame(this.menuSel);
+        if (this.menuSel === 0) {
+          if (this.nk.ready) this.startOnlineAI();
+          else this.startGame(0);
+        } else if (this.menuSel === 1) {
+          this.startGame(1);
+        } else if (this.menuSel === 2 && this.nk.ready) {
+          this.startOnlinePvP();
+        }
         this.inp.keys["Enter"] = false;
         this.inp.keys["Space"] = false;
         return;
       }
       if (this.inp.keys["ArrowUp"] || this.inp.keys["KeyW"]) {
-        this.menuSel = 0;
+        this.menuSel = Math.max(0, this.menuSel - 1);
         this.inp.keys["ArrowUp"] = false;
         this.inp.keys["KeyW"] = false;
         this.snd.init();
         this.snd.menu();
       }
       if (this.inp.keys["ArrowDown"] || this.inp.keys["KeyS"]) {
-        this.menuSel = 1;
+        this.menuSel = Math.min(2, this.menuSel + 1);
         this.inp.keys["ArrowDown"] = false;
         this.inp.keys["KeyS"] = false;
         this.snd.init();
@@ -877,12 +1121,16 @@
       if (tap) {
         const gy = (tap.y / tap.sh) * H;
         const gx = (tap.x / tap.sw) * W;
-        if (gy >= 100 && gy <= 122 && gx >= 70 && gx <= 250) {
+        if (gy >= 84 && gy <= 100 && gx >= 70 && gx <= 250) {
           this.snd.init();
-          this.startGame(0);
-        } else if (gy >= 126 && gy <= 148 && gx >= 70 && gx <= 250) {
+          if (this.nk.ready) this.startOnlineAI();
+          else this.startGame(0);
+        } else if (gy >= 102 && gy <= 118 && gx >= 70 && gx <= 250) {
           this.snd.init();
           this.startGame(1);
+        } else if (gy >= 120 && gy <= 136 && gx >= 70 && gx <= 250 && this.nk.ready) {
+          this.snd.init();
+          this.startOnlinePvP();
         }
       }
     }
@@ -932,6 +1180,101 @@
       }
     }
 
+    uOnline() {
+      // Send local input to server
+      const inp = this.inp.p1();
+      this.nk.sendInput(inp.dx, inp.jump);
+
+      // Apply server state
+      const ss = this.nk.lastState;
+      if (!ss) return;
+      const ps = this.nk.prevState;
+
+      // Interpolation factor
+      const elapsed = performance.now() - this.nk.stateTime;
+      const t = Math.min(1, elapsed / 50); // 50ms = 20Hz interval
+
+      // Map server state to game state
+      if (ss.state === 1) this.state = ST.SERVE;
+      else if (ss.state === 2) this.state = ST.PLAY;
+      else if (ss.state === 3) this.state = ST.SCORED;
+
+      this.score = ss.score;
+      this.serveSide = ss.serveSide;
+      this.timer = ss.timer;
+
+      // Determine which player is local
+      const mySide = this.nk.playerSide;
+      const myPlayer = mySide === 0 ? this.p1 : this.p2;
+      const remotePlayer = mySide === 0 ? this.p2 : this.p1;
+      const myKey = mySide === 0 ? "p1" : "p2";
+      const remoteKey = mySide === 0 ? "p2" : "p1";
+
+      // Local player: client-side prediction + reconciliation
+      myPlayer.update(inp);
+      // Reconcile with server
+      const serverMe = ss[myKey];
+      if (serverMe) {
+        const dx = Math.abs(myPlayer.x - serverMe.x);
+        const dy = Math.abs(myPlayer.y - serverMe.y);
+        if (dx > 5 || dy > 5) {
+          myPlayer.x = serverMe.x;
+          myPlayer.y = serverMe.y;
+        } else {
+          myPlayer.x += (serverMe.x - myPlayer.x) * 0.2;
+          myPlayer.y += (serverMe.y - myPlayer.y) * 0.2;
+        }
+        myPlayer.vy = serverMe.vy;
+        myPlayer.grounded = serverMe.grounded;
+      }
+
+      // Remote player: interpolate
+      const serverRemote = ss[remoteKey];
+      if (serverRemote) {
+        if (ps && ps[remoteKey]) {
+          remotePlayer.x = ps[remoteKey].x + (serverRemote.x - ps[remoteKey].x) * t;
+          remotePlayer.y = ps[remoteKey].y + (serverRemote.y - ps[remoteKey].y) * t;
+        } else {
+          remotePlayer.x = serverRemote.x;
+          remotePlayer.y = serverRemote.y;
+        }
+        remotePlayer.vy = serverRemote.vy;
+        remotePlayer.grounded = serverRemote.grounded;
+      }
+
+      // Ball: interpolate from server
+      if (ss.ball) {
+        if (ps && ps.ball) {
+          this.ball.x = ps.ball.x + (ss.ball.x - ps.ball.x) * t;
+          this.ball.y = ps.ball.y + (ss.ball.y - ps.ball.y) * t;
+          this.ball.vx = ss.ball.vx;
+          this.ball.vy = ss.ball.vy;
+          this.ball.rot = ps.ball.rot + (ss.ball.rot - ps.ball.rot) * t;
+        } else {
+          this.ball.x = ss.ball.x;
+          this.ball.y = ss.ball.y;
+          this.ball.vx = ss.ball.vx;
+          this.ball.vy = ss.ball.vy;
+          this.ball.rot = ss.ball.rot;
+        }
+        // Update trail for rendering
+        this.ball.trail.push({ x: this.ball.x, y: this.ball.y });
+        if (this.ball.trail.length > 5) this.ball.trail.shift();
+      }
+    }
+
+    uOnlineOver() {
+      const tap = this.inp.popTap();
+      if (tap || this.inp.keys["Enter"] || this.inp.keys["Space"]) {
+        this.nk.leaveMatch();
+        this.nk.fetchLeaderboard();
+        this.nk.fetchMyElo();
+        this.state = ST.MENU;
+        this.inp.keys["Enter"] = false;
+        this.inp.keys["Space"] = false;
+      }
+    }
+
     draw() {
       const ctx = this.ctx;
       // clear
@@ -958,6 +1301,10 @@
         case ST.MENU:
           this.dMenu(ctx);
           break;
+        case ST.ONLINE_WAIT:
+          this.dMenu(ctx); // draw menu in background
+          this.dOnlineWait(ctx); // overlay
+          break;
         case ST.SERVE:
         case ST.PLAY:
         case ST.SCORED:
@@ -977,6 +1324,14 @@
           this.dScore(ctx);
           this.particles.draw(ctx);
           this.dOverlay(ctx);
+          break;
+        case ST.ONLINE_OVER:
+          this.dCourt(ctx);
+          this.p1.draw(ctx);
+          this.p2.draw(ctx);
+          this.dScore(ctx);
+          this.particles.draw(ctx);
+          this.dOnlineOver(ctx);
           break;
       }
 
@@ -1048,34 +1403,33 @@
     }
 
     dMenu(ctx) {
-      // title with retro glow
       ctx.textAlign = "center";
 
       // ARCADE
       ctx.fillStyle = PAL.p1;
       ctx.font = "bold 24px monospace";
-      ctx.fillText("ARCADE", W / 2, 48);
+      ctx.fillText("ARCADE", W / 2, 45);
 
       // VOLLEYBALL
       ctx.fillStyle = PAL.p2;
       ctx.font = "bold 18px monospace";
-      ctx.fillText("VOLLEYBALL", W / 2, 70);
+      ctx.fillText("VOLLEYBALL", W / 2, 65);
 
       // subtitle
       ctx.fillStyle = PAL.dim;
       ctx.font = "8px monospace";
-      ctx.fillText("RETRO REMAKE", W / 2, 84);
+      ctx.fillText("RETRO REMAKE", W / 2, 78);
 
       // menu options
-      const opts = ["1P  VS  COMPUTER", "2P  LOCAL"];
+      const opts = ["1P  VS  COMPUTER", "2P  LOCAL", "2P  ONLINE"];
       for (let i = 0; i < opts.length; i++) {
-        const y = 110 + i * 26;
+        const y = 92 + i * 18;
         const sel = i === this.menuSel;
+        const enabled = i !== 2 || this.nk.ready;
 
-        if (sel) {
+        if (sel && enabled) {
           ctx.fillStyle = "rgba(50,50,100,0.5)";
-          ctx.fillRect(60, y - 10, W - 120, 20);
-
+          ctx.fillRect(60, y - 8, W - 120, 16);
           if (Math.floor(this.frame / 15) % 2 === 0) {
             ctx.fillStyle = PAL.text;
             ctx.font = "10px monospace";
@@ -1084,32 +1438,66 @@
           }
         }
 
-        ctx.fillStyle = sel ? PAL.text : PAL.mid;
+        ctx.fillStyle = !enabled ? "#333333" : sel ? PAL.text : PAL.mid;
         ctx.font = sel ? "bold 10px monospace" : "10px monospace";
         ctx.textAlign = "center";
         ctx.fillText(opts[i], W / 2, y + 4);
+
+        if (i === 2 && !this.nk.ready) {
+          ctx.fillStyle = "#333333";
+          ctx.font = "7px monospace";
+          ctx.fillText("CONNECTING...", W / 2, y + 13);
+        }
       }
+
+      // Leaderboard
+      this.dLeaderboard(ctx);
 
       // instructions
       ctx.fillStyle = PAL.dim;
       ctx.font = "7px monospace";
       ctx.textAlign = "center";
       if (this.inp.mobile) {
-        ctx.fillText("TAP TO SELECT", W / 2, 172);
+        ctx.fillText("TAP TO SELECT", W / 2, 192);
       } else {
-        ctx.fillText("ARROWS / ENTER TO SELECT", W / 2, 166);
-        ctx.fillText("P1: ARROWS    P2: W A S D", W / 2, 178);
+        ctx.fillText("ARROWS/ENTER  |  P1:ARROWS  P2:WASD", W / 2, 192);
+      }
+    }
+
+    dLeaderboard(ctx) {
+      const startY = 142;
+      ctx.fillStyle = PAL.dim;
+      ctx.font = "7px monospace";
+      ctx.textAlign = "center";
+      ctx.fillText("TOP PLAYERS", W / 2, startY);
+
+      if (!this.nk.ready || this.nk.leaderboard.length === 0) {
+        ctx.fillStyle = "#333333";
+        ctx.fillText("---", W / 2, startY + 10);
+        return;
       }
 
-      // decorative players
-      ctx.globalAlpha = 0.3;
-      const dp1 = new Player(55, 0, PAL.p1, PAL.p1d);
-      dp1.y = GROUND_Y;
-      dp1.draw(ctx);
-      const dp2 = new Player(W - 55, 1, PAL.p2, PAL.p2d);
-      dp2.y = GROUND_Y;
-      dp2.draw(ctx);
-      ctx.globalAlpha = 1;
+      const lb = this.nk.leaderboard.slice(0, 5);
+      for (let i = 0; i < lb.length; i++) {
+        const y = startY + 10 + i * 8;
+        const e = lb[i];
+        const name = (e.username || "???").substring(0, 10);
+        ctx.textAlign = "left";
+        ctx.fillStyle = i === 0 ? PAL.p1 : i === 1 ? PAL.p2 : PAL.mid;
+        ctx.fillText((i + 1) + ". " + name, 70, y);
+        ctx.textAlign = "right";
+        ctx.fillStyle = PAL.mid;
+        ctx.fillText("" + e.elo, 250, y);
+      }
+
+      // Own ELO
+      if (this.nk.myElo) {
+        const myY = startY + 10 + Math.min(lb.length, 5) * 8 + 3;
+        ctx.textAlign = "center";
+        ctx.fillStyle = PAL.p1;
+        const rk = this.nk.myRank ? " (#" + this.nk.myRank + ")" : "";
+        ctx.fillText("YOUR ELO: " + this.nk.myElo + rk, W / 2, myY);
+      }
     }
 
     dPointMsg(ctx) {
@@ -1118,9 +1506,13 @@
       ctx.fillStyle = this.serveSide === 0 ? PAL.p1 : PAL.p2;
       ctx.font = "bold 10px monospace";
       ctx.textAlign = "center";
-      const who =
-        this.serveSide === 0 ? "P1" : this.mode === 0 ? "CPU" : "P2";
-      ctx.fillText(who + " SCORES!", W / 2, H / 2 + 2);
+      let who;
+      if (this.mode >= 2) {
+        who = this.serveSide === this.nk.playerSide ? "YOU" : "OPPONENT";
+      } else {
+        who = this.serveSide === 0 ? "P1" : this.mode === 0 ? "CPU" : "P2";
+      }
+      ctx.fillText(who + " SCORE" + (who === "YOU" ? "" : "S") + "!", W / 2, H / 2 + 2);
     }
 
     dServeMsg(ctx) {
@@ -1142,10 +1534,15 @@
       ctx.fillText("GAME OVER", W / 2, H / 2 - 25);
 
       const w = this.score[0] >= WIN_SCORE ? 0 : 1;
-      const wn = w === 0 ? "PLAYER 1" : this.mode === 0 ? "COMPUTER" : "PLAYER 2";
+      let wn;
+      if (this.mode >= 2) {
+        wn = w === this.nk.playerSide ? "YOU" : "OPPONENT";
+      } else {
+        wn = w === 0 ? "PLAYER 1" : this.mode === 0 ? "COMPUTER" : "PLAYER 2";
+      }
       ctx.fillStyle = w === 0 ? PAL.p1 : PAL.p2;
       ctx.font = "bold 12px monospace";
-      ctx.fillText(wn + " WINS!", W / 2, H / 2);
+      ctx.fillText(wn + " WIN" + (wn === "YOU" ? "!" : "S!"), W / 2, H / 2);
 
       ctx.fillStyle = PAL.mid;
       ctx.font = "10px monospace";
@@ -1155,6 +1552,60 @@
         ctx.fillStyle = PAL.dim;
         ctx.font = "8px monospace";
         ctx.fillText("TAP OR PRESS ENTER", W / 2, H / 2 + 38);
+      }
+    }
+
+    dOnlineWait(ctx) {
+      ctx.fillStyle = "rgba(0,0,0,0.8)";
+      ctx.fillRect(0, 0, W, H);
+      ctx.textAlign = "center";
+      ctx.fillStyle = PAL.text;
+      ctx.font = "bold 12px monospace";
+      ctx.fillText("SEARCHING", W / 2, H / 2 - 15);
+      const dots = ".".repeat((Math.floor(this.frame / 20) % 3) + 1);
+      ctx.fillStyle = PAL.mid;
+      ctx.font = "10px monospace";
+      ctx.fillText(dots, W / 2, H / 2);
+      if (this.nk.opponentName) {
+        ctx.fillStyle = PAL.p2;
+        ctx.fillText("VS " + this.nk.opponentName, W / 2, H / 2 + 15);
+      }
+      ctx.fillStyle = PAL.dim;
+      ctx.font = "8px monospace";
+      ctx.fillText("PRESS ESC TO CANCEL", W / 2, H / 2 + 35);
+    }
+
+    dOnlineOver(ctx) {
+      ctx.fillStyle = "rgba(0,0,0,0.7)";
+      ctx.fillRect(0, 0, W, H);
+      ctx.textAlign = "center";
+      ctx.fillStyle = PAL.text;
+      ctx.font = "bold 18px monospace";
+      ctx.fillText("GAME OVER", W / 2, H / 2 - 30);
+
+      const w = this.score[0] >= WIN_SCORE ? 0 : 1;
+      const wn = w === this.nk.playerSide ? "YOU WIN!" : "YOU LOSE";
+      ctx.fillStyle = w === this.nk.playerSide ? "#55FF55" : "#FF5555";
+      ctx.font = "bold 12px monospace";
+      ctx.fillText(wn, W / 2, H / 2 - 10);
+
+      ctx.fillStyle = PAL.mid;
+      ctx.font = "10px monospace";
+      ctx.fillText(this.score[0] + " - " + this.score[1], W / 2, H / 2 + 8);
+
+      // ELO change
+      if (this.nk.eloResult) {
+        const d = this.nk.eloResult.delta;
+        const sign = d >= 0 ? "+" : "";
+        ctx.fillStyle = d >= 0 ? "#55FF55" : "#FF5555";
+        ctx.font = "bold 9px monospace";
+        ctx.fillText(sign + d + " ELO (" + this.nk.eloResult.newElo + ")", W / 2, H / 2 + 24);
+      }
+
+      if (Math.floor(this.frame / 20) % 2 === 0) {
+        ctx.fillStyle = PAL.dim;
+        ctx.font = "8px monospace";
+        ctx.fillText("TAP OR PRESS ENTER", W / 2, H / 2 + 42);
       }
     }
 
