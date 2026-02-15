@@ -1188,9 +1188,9 @@
         this.state = ST.MENU;
         return;
       }
-      // Send local input to server at 20Hz (every 3rd frame), skip in AI matches
+      // Send local input to server at 20Hz (every 3rd frame)
       const inp = this.inp.p1();
-      if (this.mode === 3 && this.frame % 3 === 0) {
+      if (this.frame % 3 === 0) {
         this.nk.sendInput(inp.dx, inp.jump);
       }
 
