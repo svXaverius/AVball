@@ -903,6 +903,22 @@
       this.ball = new Ball();
       this.ai = new AI();
 
+      // Debug log
+      this._log = [];
+      this._logEvt = (type, data) => {
+        this._log.push({ f: this.frame, t: type, ...data });
+        if (this._log.length > 2000) this._log.shift();
+      };
+      this._sendLog = () => {
+        if (this._log.length === 0) return;
+        const payload = { events: this._log, ts: Date.now() };
+        fetch("/api/debug-log", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        }).catch(() => {});
+      };
+
       // Nakama online — set callbacks before init so they're in place for socket events
       this.nk = new NakamaClient();
       this.nk.onMatchStart = (info) => {
@@ -913,10 +929,14 @@
         this.particles.list = [];
         this.snd.init();
         this.snd.menu();
+        this._log = [];
+        this._logEvt("MATCH_START", { side: info.side, opponent: info.opponent });
       };
       this.nk.onGameOver = (result) => {
         this.state = ST.ONLINE_OVER;
         this.snd.win();
+        this._logEvt("GAME_OVER", { winner: result.winner, score: result.score });
+        this._sendLog();
       };
       this.nk.init().catch(e => console.warn("NK init:", e));
 
@@ -1205,6 +1225,16 @@
       if (ss && ss !== this._lastApplied) {
         this._lastApplied = ss;
 
+        // Log every snapshot
+        this._logEvt("SNAP", {
+          srvState: ss.state, score: ss.score, timer: ss.timer, serveSide: ss.serveSide,
+          p1: ss.p1 ? { x: +ss.p1.x.toFixed(1), y: +ss.p1.y.toFixed(1) } : null,
+          p2: ss.p2 ? { x: +ss.p2.x.toFixed(1), y: +ss.p2.y.toFixed(1) } : null,
+          ball: ss.ball ? { x: +ss.ball.x.toFixed(1), y: +ss.ball.y.toFixed(1), vx: +ss.ball.vx.toFixed(2), vy: +ss.ball.vy.toFixed(2) } : null,
+          rendBall: { x: +this.ball.x.toFixed(1), y: +this.ball.y.toFixed(1), vx: +this.ball.vx.toFixed(2), vy: +this.ball.vy.toFixed(2) },
+          ballLocal: this._ballLocal, clientState: this.state,
+        });
+
         if (ss.state === 1) this.state = ST.SERVE;
         else if (ss.state === 2) this.state = ST.PLAY;
         else if (ss.state === 3) this.state = ST.SCORED;
@@ -1215,6 +1245,7 @@
 
         // State transition → snap everything
         if (ss.state !== this._lastServerState) {
+          this._logEvt("TRANS", { from: this._lastServerState, to: ss.state, score: ss.score });
           this._lastServerState = ss.state;
           const myD = ss[myKey]; const rmD = ss[rmKey];
           if (myD) { myPlayer.x = myD.x; myPlayer.y = myD.y; myPlayer.vy = myD.vy; myPlayer.grounded = myD.grounded; }
@@ -1236,16 +1267,20 @@
           const wasLocal = this._ballLocal;
           this._ballLocal = mySide === 0 ? ss.ball.x < NET_X : ss.ball.x >= NET_X;
 
+          if (wasLocal !== this._ballLocal) {
+            this._logEvt("BALL_SW", { from: wasLocal ? "LOCAL" : "REMOTE", to: this._ballLocal ? "LOCAL" : "REMOTE",
+              srvBall: { x: +ss.ball.x.toFixed(1), y: +ss.ball.y.toFixed(1) },
+              rendBall: { x: +this.ball.x.toFixed(1), y: +this.ball.y.toFixed(1) } });
+          }
+
           if (this._ballLocal && !wasLocal) {
-            // Ball just arrived on my side → snap for local physics start
             this.ball.x = ss.ball.x; this.ball.y = ss.ball.y;
             this.ball.vx = ss.ball.vx; this.ball.vy = ss.ball.vy;
             this.ball.rot = ss.ball.rot;
           }
 
           if (!this._ballLocal) {
-            // Ball on remote side → set position/velocity from server (dead reckoning start)
-            // Detect sounds from velocity changes before overwriting
+            // Detect sounds from velocity changes
             if (this._olPrevBall) {
               const pb = this._olPrevBall; const nb = ss.ball;
               const dvx = Math.abs(nb.vx - pb.vx); const dvy = Math.abs(nb.vy - pb.vy);
@@ -1283,6 +1318,7 @@
         if (myD) {
           const ex = Math.abs(myD.x - myPlayer.x); const ey = Math.abs(myD.y - myPlayer.y);
           if (ex > 50 || ey > 50) {
+            this._logEvt("MY_SNAP", { ex: +ex.toFixed(1), ey: +ey.toFixed(1) });
             myPlayer.x = myD.x; myPlayer.y = myD.y;
             myPlayer.vy = myD.vy; myPlayer.grounded = myD.grounded;
           }
@@ -1317,45 +1353,46 @@
           // Ball on my side → full local physics
           this.ball.update(this.snd);
           this.ball.hitPlayer(myPlayer, this.snd, this.particles);
-          // Don't score locally — server is authoritative
           if (this.ball.y + BALL_R >= GROUND_Y) {
             this.ball.y = GROUND_Y - BALL_R;
             this.ball.vy = 0;
           }
         } else {
-          // Ball on remote side → dead reckoning (extrapolate from last server snapshot)
-          // Same physics as server: gravity, walls, net, ceiling, ground
+          // Ball on remote side → dead reckoning
           this.ball.vy += GRAVITY;
           this.ball.x += this.ball.vx;
           this.ball.y += this.ball.vy;
           this.ball.rot += this.ball.vx * 0.06;
-          // Wall bounces
           if (this.ball.x - BALL_R < 0) { this.ball.x = BALL_R; this.ball.vx = Math.abs(this.ball.vx); }
           if (this.ball.x + BALL_R > W) { this.ball.x = W - BALL_R; this.ball.vx = -Math.abs(this.ball.vx); }
           if (this.ball.y - BALL_R < 0) { this.ball.y = BALL_R; this.ball.vy = Math.abs(this.ball.vy); }
-          // Net collision
           this.ball.hitNet(this.snd);
-          // Ground — ball visible resting on ground until server confirms score
           if (this.ball.y + BALL_R >= GROUND_Y) {
             this.ball.y = GROUND_Y - BALL_R;
             this.ball.vy = 0;
             this.ball.vx *= 0.9;
           }
-          // Trail
           this.ball.trail.push({ x: this.ball.x, y: this.ball.y });
           if (this.ball.trail.length > 5) this.ball.trail.shift();
         }
       }
 
-      // Debug info
+      // Periodic frame log (every 30 frames ≈ 2x/sec)
+      if (this.frame % 30 === 0 && this.state >= ST.SERVE && this.state <= ST.SCORED) {
+        this._logEvt("TICK", {
+          state: this.state, ballLocal: this._ballLocal,
+          ball: { x: +this.ball.x.toFixed(1), y: +this.ball.y.toFixed(1), vx: +this.ball.vx.toFixed(2), vy: +this.ball.vy.toFixed(2) },
+          my: { x: +myPlayer.x.toFixed(1), y: +myPlayer.y.toFixed(1) },
+          rm: { x: +remotePlayer.x.toFixed(1), y: +remotePlayer.y.toFixed(1) },
+        });
+      }
+
+      // Debug overlay data
       if (this._dbg) {
         this._dbgInfo = {
-          side: mySide,
-          ballLocal: this._ballLocal,
-          ballX: Math.round(this.ball.x),
-          ballY: Math.round(this.ball.y),
-          state: this.state,
-          srvState: this._lastServerState,
+          side: mySide, ballLocal: this._ballLocal,
+          ballX: Math.round(this.ball.x), ballY: Math.round(this.ball.y),
+          state: this.state, srvState: this._lastServerState,
         };
       }
     }
@@ -1363,6 +1400,7 @@
     uOnlineOver() {
       const tap = this.inp.popTap();
       if (tap || this.inp.keys["Enter"] || this.inp.keys["Space"]) {
+        this._sendLog();
         this.nk.leaveMatch();
         this.nk.fetchLeaderboard();
         this.nk.fetchMyElo();
