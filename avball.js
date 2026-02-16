@@ -918,6 +918,10 @@
           body: JSON.stringify(payload),
         }).catch(() => {});
       };
+      // Auto-send log every 10 seconds during online play
+      setInterval(() => {
+        if (this.mode >= 2 && this._log.length > 0) this._sendLog();
+      }, 10000);
 
       // Nakama online — set callbacks before init so they're in place for socket events
       this.nk = new NakamaClient();
@@ -1256,6 +1260,7 @@
             this.ball.rot = ss.ball.rot; this.ball.trail = [];
           }
           this._olInterp = null;
+          this._ballInterp = null;
           if (ss.state === 3) {
             this.shake = 8; this.snd.score();
             this.particles.emit(this.ball.x, GROUND_Y, this.serveSide === 0 ? PAL.p1 : PAL.p2, 8, 4);
@@ -1271,6 +1276,32 @@
           rmToVy: rmD ? rmD.vy : 0, rmToGr: rmD ? rmD.grounded : true,
           t: 0,
         };
+
+        // Ball interpolation: smooth between server snapshots
+        if (ss.ball) {
+          // Detect sounds from velocity changes
+          if (this._ballInterp) {
+            const pb = this._ballInterp; const nb = ss.ball;
+            const dvx = Math.abs(nb.vx - pb.toVx); const dvy = Math.abs(nb.vy - pb.toVy);
+            if (dvx > 0.3 || dvy > 0.5) {
+              if (nb.x < BALL_R + 5 || nb.x > W - BALL_R - 5) this.snd.wall();
+              else if (nb.y < BALL_R + 5 && nb.vy > 0) this.snd.wall();
+              else if (Math.abs(nb.x - NET_X) < 15 && nb.y + BALL_R >= NET_TOP) this.snd.net();
+              else {
+                this.snd.hit();
+                const nearP1 = Math.abs(nb.x - this.p1.hx) + Math.abs(nb.y - this.p1.hy);
+                const nearP2 = Math.abs(nb.x - this.p2.hx) + Math.abs(nb.y - this.p2.hy);
+                this.particles.emit(nb.x, nb.y, (nearP1 < nearP2 ? this.p1 : this.p2).color, 4, 3);
+              }
+            }
+          }
+          this._ballInterp = {
+            fromX: this.ball.x, fromY: this.ball.y,
+            toX: ss.ball.x, toY: ss.ball.y,
+            toVx: ss.ball.vx, toVy: ss.ball.vy,
+            toRot: ss.ball.rot, t: 0,
+          };
+        }
 
         // Local player: trust local physics, only snap on major desync
         const myD = ss[myKey];
@@ -1306,19 +1337,26 @@
         }
       }
 
-      // --- Ball: full local physics, interacts with BOTH players ---
-      // Server is authoritative only for state transitions (scoring).
-      // Ball runs entirely on client to avoid desync between server ball
-      // (which uses delayed inputs) and client ball.
-      if (this.state === ST.PLAY) {
-        this.ball.update(this.snd);
-        this.ball.hitPlayer(myPlayer, this.snd, this.particles);
-        this.ball.hitPlayer(remotePlayer, this.snd, this.particles);
-        // Client does NOT detect scoring — server handles it via TRANS
-        if (this.ball.y + BALL_R >= GROUND_Y) {
-          this.ball.y = GROUND_Y - BALL_R;
-          this.ball.vy = 0; this.ball.vx *= 0.9;
+      // --- Ball: interpolation between server snapshots ---
+      // Server runs authoritative ball physics. Client smoothly interpolates
+      // between consecutive server positions (30Hz → 60fps).
+      const bp = this._ballInterp;
+      if (bp) {
+        bp.t += 0.5; // reaches 1.0 in 2 frames (= one 30Hz server tick)
+        const t = Math.min(bp.t, 1);
+        this.ball.x = bp.fromX + (bp.toX - bp.fromX) * t;
+        this.ball.y = bp.fromY + (bp.toY - bp.fromY) * t;
+        this.ball.vx = bp.toVx;
+        this.ball.vy = bp.toVy;
+        this.ball.rot = bp.toRot;
+        // Extrapolate past t=1 if no new snapshot yet
+        if (bp.t > 1) {
+          const extra = bp.t - 1;
+          this.ball.x = bp.toX + bp.toVx * extra;
+          this.ball.y = bp.toY + (bp.toVy + GRAVITY * extra * 0.5) * extra;
         }
+        this.ball.trail.push({ x: this.ball.x, y: this.ball.y });
+        if (this.ball.trail.length > 5) this.ball.trail.shift();
       }
 
       // Periodic frame log (every 30 frames ≈ 2x/sec)
