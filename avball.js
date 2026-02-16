@@ -1232,7 +1232,7 @@
           p2: ss.p2 ? { x: +ss.p2.x.toFixed(1), y: +ss.p2.y.toFixed(1) } : null,
           ball: ss.ball ? { x: +ss.ball.x.toFixed(1), y: +ss.ball.y.toFixed(1), vx: +ss.ball.vx.toFixed(2), vy: +ss.ball.vy.toFixed(2) } : null,
           rendBall: { x: +this.ball.x.toFixed(1), y: +this.ball.y.toFixed(1), vx: +this.ball.vx.toFixed(2), vy: +this.ball.vy.toFixed(2) },
-          ballLocal: this._ballLocal, clientState: this.state,
+          clientState: this.state,
         });
 
         if (ss.state === 1) this.state = ST.SERVE;
@@ -1243,7 +1243,7 @@
         this.serveSide = ss.serveSide;
         this.timer = ss.timer;
 
-        // State transition → snap everything
+        // State transition → snap everything to server
         if (ss.state !== this._lastServerState) {
           this._logEvt("TRANS", { from: this._lastServerState, to: ss.state, score: ss.score });
           this._lastServerState = ss.state;
@@ -1251,8 +1251,9 @@
           if (myD) { myPlayer.x = myD.x; myPlayer.y = myD.y; myPlayer.vy = myD.vy; myPlayer.grounded = myD.grounded; }
           if (rmD) { remotePlayer.x = rmD.x; remotePlayer.y = rmD.y; remotePlayer.vy = rmD.vy; remotePlayer.grounded = rmD.grounded; }
           if (ss.ball) {
-            this.ball.x = ss.ball.x; this.ball.y = ss.ball.y; this.ball.vx = ss.ball.vx; this.ball.vy = ss.ball.vy; this.ball.rot = ss.ball.rot; this.ball.trail = [];
-            this._ballLocal = mySide === 0 ? ss.ball.x < NET_X : ss.ball.x >= NET_X;
+            this.ball.x = ss.ball.x; this.ball.y = ss.ball.y;
+            this.ball.vx = ss.ball.vx; this.ball.vy = ss.ball.vy;
+            this.ball.rot = ss.ball.rot; this.ball.trail = [];
           }
           this._olInterp = null;
           if (ss.state === 3) {
@@ -1260,48 +1261,6 @@
             this.particles.emit(this.ball.x, GROUND_Y, this.serveSide === 0 ? PAL.p1 : PAL.p2, 8, 4);
           }
           return;
-        }
-
-        // Determine ball ownership from server
-        if (ss.ball) {
-          const wasLocal = this._ballLocal;
-          this._ballLocal = mySide === 0 ? ss.ball.x < NET_X : ss.ball.x >= NET_X;
-
-          if (wasLocal !== this._ballLocal) {
-            this._logEvt("BALL_SW", { from: wasLocal ? "LOCAL" : "REMOTE", to: this._ballLocal ? "LOCAL" : "REMOTE",
-              srvBall: { x: +ss.ball.x.toFixed(1), y: +ss.ball.y.toFixed(1) },
-              rendBall: { x: +this.ball.x.toFixed(1), y: +this.ball.y.toFixed(1) } });
-          }
-
-          if (this._ballLocal && !wasLocal) {
-            this.ball.x = ss.ball.x; this.ball.y = ss.ball.y;
-            this.ball.vx = ss.ball.vx; this.ball.vy = ss.ball.vy;
-            this.ball.rot = ss.ball.rot;
-          }
-
-          if (!this._ballLocal) {
-            // Detect sounds from velocity changes
-            if (this._olPrevBall) {
-              const pb = this._olPrevBall; const nb = ss.ball;
-              const dvx = Math.abs(nb.vx - pb.vx); const dvy = Math.abs(nb.vy - pb.vy);
-              if (dvx > 0.3 || dvy > 0.5) {
-                if (nb.x < BALL_R + 5 || nb.x > W - BALL_R - 5) this.snd.wall();
-                else if (nb.y < BALL_R + 5 && nb.vy > 0) this.snd.wall();
-                else if (Math.abs(nb.x - NET_X) < 15 && nb.y + BALL_R >= NET_TOP) this.snd.net();
-                else {
-                  this.snd.hit();
-                  const nearP1 = Math.abs(nb.x - this.p1.hx) + Math.abs(nb.y - this.p1.hy);
-                  const nearP2 = Math.abs(nb.x - this.p2.hx) + Math.abs(nb.y - this.p2.hy);
-                  this.particles.emit(nb.x, nb.y, (nearP1 < nearP2 ? this.p1 : this.p2).color, 4, 3);
-                }
-              }
-            }
-            this._olPrevBall = { vx: ss.ball.vx, vy: ss.ball.vy, x: ss.ball.x, y: ss.ball.y };
-            // Snap ball to server state for dead reckoning
-            this.ball.x = ss.ball.x; this.ball.y = ss.ball.y;
-            this.ball.vx = ss.ball.vx; this.ball.vy = ss.ball.vy;
-            this.ball.rot = ss.ball.rot;
-          }
         }
 
         // Remote player interpolation setup
@@ -1347,40 +1306,25 @@
         }
       }
 
-      // --- Ball ---
+      // --- Ball: full local physics, interacts with BOTH players ---
+      // Server is authoritative only for state transitions (scoring).
+      // Ball runs entirely on client to avoid desync between server ball
+      // (which uses delayed inputs) and client ball.
       if (this.state === ST.PLAY) {
-        if (this._ballLocal) {
-          // Ball on my side → full local physics
-          this.ball.update(this.snd);
-          this.ball.hitPlayer(myPlayer, this.snd, this.particles);
-          if (this.ball.y + BALL_R >= GROUND_Y) {
-            this.ball.y = GROUND_Y - BALL_R;
-            this.ball.vy = 0;
-          }
-        } else {
-          // Ball on remote side → dead reckoning
-          this.ball.vy += GRAVITY;
-          this.ball.x += this.ball.vx;
-          this.ball.y += this.ball.vy;
-          this.ball.rot += this.ball.vx * 0.06;
-          if (this.ball.x - BALL_R < 0) { this.ball.x = BALL_R; this.ball.vx = Math.abs(this.ball.vx); }
-          if (this.ball.x + BALL_R > W) { this.ball.x = W - BALL_R; this.ball.vx = -Math.abs(this.ball.vx); }
-          if (this.ball.y - BALL_R < 0) { this.ball.y = BALL_R; this.ball.vy = Math.abs(this.ball.vy); }
-          this.ball.hitNet(this.snd);
-          if (this.ball.y + BALL_R >= GROUND_Y) {
-            this.ball.y = GROUND_Y - BALL_R;
-            this.ball.vy = 0;
-            this.ball.vx *= 0.9;
-          }
-          this.ball.trail.push({ x: this.ball.x, y: this.ball.y });
-          if (this.ball.trail.length > 5) this.ball.trail.shift();
+        this.ball.update(this.snd);
+        this.ball.hitPlayer(myPlayer, this.snd, this.particles);
+        this.ball.hitPlayer(remotePlayer, this.snd, this.particles);
+        // Client does NOT detect scoring — server handles it via TRANS
+        if (this.ball.y + BALL_R >= GROUND_Y) {
+          this.ball.y = GROUND_Y - BALL_R;
+          this.ball.vy = 0; this.ball.vx *= 0.9;
         }
       }
 
       // Periodic frame log (every 30 frames ≈ 2x/sec)
       if (this.frame % 30 === 0 && this.state >= ST.SERVE && this.state <= ST.SCORED) {
         this._logEvt("TICK", {
-          state: this.state, ballLocal: this._ballLocal,
+          state: this.state,
           ball: { x: +this.ball.x.toFixed(1), y: +this.ball.y.toFixed(1), vx: +this.ball.vx.toFixed(2), vy: +this.ball.vy.toFixed(2) },
           my: { x: +myPlayer.x.toFixed(1), y: +myPlayer.y.toFixed(1) },
           rm: { x: +remotePlayer.x.toFixed(1), y: +remotePlayer.y.toFixed(1) },
@@ -1390,7 +1334,7 @@
       // Debug overlay data
       if (this._dbg) {
         this._dbgInfo = {
-          side: mySide, ballLocal: this._ballLocal,
+          side: mySide,
           ballX: Math.round(this.ball.x), ballY: Math.round(this.ball.y),
           state: this.state, srvState: this._lastServerState,
         };
