@@ -348,7 +348,7 @@
       ) {
         this.y = NET_TOP - BALL_R;
         this.vy = -Math.abs(this.vy) * 0.7;
-        snd.net();
+        if (snd) snd.net();
         return;
       }
       // side of net
@@ -359,7 +359,7 @@
         this.x = nr + BALL_R;
         this.vx = Math.abs(this.vx) * BOUNCE_DAMP;
       }
-      snd.net();
+      if (snd) snd.net();
     }
     hitPlayer(p, snd, particles) {
       const dx = this.x - p.hx;
@@ -1260,7 +1260,6 @@
             this.ball.rot = ss.ball.rot; this.ball.trail = [];
           }
           this._olInterp = null;
-          this._ballInterp = null;
           if (ss.state === 3) {
             this.shake = 8; this.snd.score();
             this.particles.emit(this.ball.x, GROUND_Y, this.serveSide === 0 ? PAL.p1 : PAL.p2, 8, 4);
@@ -1277,12 +1276,12 @@
           t: 0,
         };
 
-        // Ball interpolation: smooth between server snapshots
+        // Ball: snap to server state on each snapshot
         if (ss.ball) {
-          // Detect sounds from velocity changes
-          if (this._ballInterp) {
-            const pb = this._ballInterp; const nb = ss.ball;
-            const dvx = Math.abs(nb.vx - pb.toVx); const dvy = Math.abs(nb.vy - pb.toVy);
+          // Detect sounds from velocity changes vs previous snapshot
+          if (this._prevSrvBall) {
+            const pb = this._prevSrvBall; const nb = ss.ball;
+            const dvx = Math.abs(nb.vx - pb.vx); const dvy = Math.abs(nb.vy - pb.vy);
             if (dvx > 0.3 || dvy > 0.5) {
               if (nb.x < BALL_R + 5 || nb.x > W - BALL_R - 5) this.snd.wall();
               else if (nb.y < BALL_R + 5 && nb.vy > 0) this.snd.wall();
@@ -1295,12 +1294,11 @@
               }
             }
           }
-          this._ballInterp = {
-            fromX: this.ball.x, fromY: this.ball.y,
-            toX: ss.ball.x, toY: ss.ball.y,
-            toVx: ss.ball.vx, toVy: ss.ball.vy,
-            toRot: ss.ball.rot, t: 0,
-          };
+          this._prevSrvBall = { vx: ss.ball.vx, vy: ss.ball.vy, x: ss.ball.x, y: ss.ball.y };
+          // Snap ball to server position + velocity
+          this.ball.x = ss.ball.x; this.ball.y = ss.ball.y;
+          this.ball.vx = ss.ball.vx; this.ball.vy = ss.ball.vy;
+          this.ball.rot = ss.ball.rot;
         }
 
         // Local player: trust local physics, only snap on major desync
@@ -1337,23 +1335,25 @@
         }
       }
 
-      // --- Ball: interpolation between server snapshots ---
-      // Server runs authoritative ball physics. Client smoothly interpolates
-      // between consecutive server positions (30Hz → 60fps).
-      const bp = this._ballInterp;
-      if (bp) {
-        bp.t += 0.5; // reaches 1.0 in 2 frames (= one 30Hz server tick)
-        const t = Math.min(bp.t, 1);
-        this.ball.x = bp.fromX + (bp.toX - bp.fromX) * t;
-        this.ball.y = bp.fromY + (bp.toY - bp.fromY) * t;
-        this.ball.vx = bp.toVx;
-        this.ball.vy = bp.toVy;
-        this.ball.rot = bp.toRot;
-        // Extrapolate past t=1 if no new snapshot yet
-        if (bp.t > 1) {
-          const extra = bp.t - 1;
-          this.ball.x = bp.toX + bp.toVx * extra;
-          this.ball.y = bp.toY + (bp.toVy + GRAVITY * extra * 0.5) * extra;
+      // --- Ball: physics extrapolation between server snapshots ---
+      // On each snapshot, ball is snapped to server state (above).
+      // Between snapshots, advance with gravity + wall/net/ground collisions
+      // but NO player collisions (server handles those).
+      if (this.state === ST.PLAY) {
+        this.ball.vy += GRAVITY;
+        this.ball.x += this.ball.vx;
+        this.ball.y += this.ball.vy;
+        this.ball.rot += this.ball.vx * 0.06;
+        // Walls
+        if (this.ball.x - BALL_R < 0) { this.ball.x = BALL_R; this.ball.vx = Math.abs(this.ball.vx); }
+        if (this.ball.x + BALL_R > W) { this.ball.x = W - BALL_R; this.ball.vx = -Math.abs(this.ball.vx); }
+        if (this.ball.y - BALL_R < 0) { this.ball.y = BALL_R; this.ball.vy = Math.abs(this.ball.vy); }
+        // Net
+        this.ball.hitNet(null); // no sound — server detects it
+        // Ground clamp
+        if (this.ball.y + BALL_R >= GROUND_Y) {
+          this.ball.y = GROUND_Y - BALL_R;
+          this.ball.vy = 0; this.ball.vx *= 0.9;
         }
         this.ball.trail.push({ x: this.ball.x, y: this.ball.y });
         if (this.ball.trail.length > 5) this.ball.trail.shift();
