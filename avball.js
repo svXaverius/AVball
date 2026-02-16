@@ -1019,6 +1019,12 @@
       this.particles.update();
       if (this.shake > 0) this.shake--;
 
+      // Debug toggle
+      if (this.inp.keys["Backquote"]) {
+        this._dbg = !this._dbg;
+        this.inp.keys["Backquote"] = false;
+      }
+
       // Online modes — server is authoritative for SERVE/PLAY/SCORED states
       if (this.mode >= 2 && this.state >= ST.SERVE && this.state <= ST.SCORED) {
         this.uOnline();
@@ -1225,38 +1231,45 @@
           return;
         }
 
-        // Determine ball ownership: server says which side the ball is on
+        // Determine ball ownership from server
         if (ss.ball) {
           const wasLocal = this._ballLocal;
           this._ballLocal = mySide === 0 ? ss.ball.x < NET_X : ss.ball.x >= NET_X;
-          // Ball just arrived on my side → snap to server for accurate local physics start
+
           if (this._ballLocal && !wasLocal) {
+            // Ball just arrived on my side → snap for local physics start
+            this.ball.x = ss.ball.x; this.ball.y = ss.ball.y;
+            this.ball.vx = ss.ball.vx; this.ball.vy = ss.ball.vy;
+            this.ball.rot = ss.ball.rot;
+          }
+
+          if (!this._ballLocal) {
+            // Ball on remote side → set position/velocity from server (dead reckoning start)
+            // Detect sounds from velocity changes before overwriting
+            if (this._olPrevBall) {
+              const pb = this._olPrevBall; const nb = ss.ball;
+              const dvx = Math.abs(nb.vx - pb.vx); const dvy = Math.abs(nb.vy - pb.vy);
+              if (dvx > 0.3 || dvy > 0.5) {
+                if (nb.x < BALL_R + 5 || nb.x > W - BALL_R - 5) this.snd.wall();
+                else if (nb.y < BALL_R + 5 && nb.vy > 0) this.snd.wall();
+                else if (Math.abs(nb.x - NET_X) < 15 && nb.y + BALL_R >= NET_TOP) this.snd.net();
+                else {
+                  this.snd.hit();
+                  const nearP1 = Math.abs(nb.x - this.p1.hx) + Math.abs(nb.y - this.p1.hy);
+                  const nearP2 = Math.abs(nb.x - this.p2.hx) + Math.abs(nb.y - this.p2.hy);
+                  this.particles.emit(nb.x, nb.y, (nearP1 < nearP2 ? this.p1 : this.p2).color, 4, 3);
+                }
+              }
+            }
+            this._olPrevBall = { vx: ss.ball.vx, vy: ss.ball.vy, x: ss.ball.x, y: ss.ball.y };
+            // Snap ball to server state for dead reckoning
             this.ball.x = ss.ball.x; this.ball.y = ss.ball.y;
             this.ball.vx = ss.ball.vx; this.ball.vy = ss.ball.vy;
             this.ball.rot = ss.ball.rot;
           }
         }
 
-        // Ball sounds from snapshots (only when ball is on REMOTE side)
-        if (!this._ballLocal && this._olPrevBall && ss.ball) {
-          const pb = this._olPrevBall; const nb = ss.ball;
-          const dvx = Math.abs(nb.vx - pb.vx); const dvy = Math.abs(nb.vy - pb.vy);
-          if (dvx > 0.3 || dvy > 0.5) {
-            if (nb.x < BALL_R + 5 || nb.x > W - BALL_R - 5) this.snd.wall();
-            else if (nb.y < BALL_R + 5 && nb.vy > 0) this.snd.wall();
-            else if (Math.abs(nb.x - NET_X) < 15 && nb.y + BALL_R >= NET_TOP) this.snd.net();
-            else {
-              this.snd.hit();
-              const nearP1 = Math.abs(nb.x - this.p1.hx) + Math.abs(nb.y - this.p1.hy);
-              const nearP2 = Math.abs(nb.x - this.p2.hx) + Math.abs(nb.y - this.p2.hy);
-              const hitP = nearP1 < nearP2 ? this.p1 : this.p2;
-              this.particles.emit(nb.x, nb.y, hitP.color, 4, 3);
-            }
-          }
-        }
-        this._olPrevBall = ss.ball ? { vx: ss.ball.vx, vy: ss.ball.vy, x: ss.ball.x, y: ss.ball.y } : null;
-
-        // Setup interpolation for remote player (always) and ball (only when on remote side)
+        // Remote player interpolation setup
         const rmD = ss[rmKey];
         this._olInterp = {
           rmFromX: remotePlayer.x, rmFromY: remotePlayer.y,
@@ -1264,13 +1277,6 @@
           rmToVy: rmD ? rmD.vy : 0, rmToGr: rmD ? rmD.grounded : true,
           t: 0,
         };
-        if (!this._ballLocal && ss.ball) {
-          this._olInterp.ballFromX = this.ball.x; this._olInterp.ballFromY = this.ball.y; this._olInterp.ballFromRot = this.ball.rot;
-          this._olInterp.ballToX = ss.ball.x; this._olInterp.ballToY = ss.ball.y;
-          this._olInterp.ballToVx = ss.ball.vx; this._olInterp.ballToVy = ss.ball.vy;
-          this._olInterp.ballToRot = ss.ball.rot;
-          this._olInterp.hasBall = true;
-        }
 
         // Local player: trust local physics, only snap on major desync
         const myD = ss[myKey];
@@ -1308,7 +1314,7 @@
       // --- Ball ---
       if (this.state === ST.PLAY) {
         if (this._ballLocal) {
-          // Ball on my side → local physics (instant response)
+          // Ball on my side → full local physics
           this.ball.update(this.snd);
           this.ball.hitPlayer(myPlayer, this.snd, this.particles);
           // Don't score locally — server is authoritative
@@ -1316,27 +1322,41 @@
             this.ball.y = GROUND_Y - BALL_R;
             this.ball.vy = 0;
           }
-        } else if (ip && ip.hasBall) {
-          // Ball on remote side → interpolation from server
-          if (ip.t <= 1) {
-            this.ball.x = ip.ballFromX + (ip.ballToX - ip.ballFromX) * ip.t;
-            this.ball.y = ip.ballFromY + (ip.ballToY - ip.ballFromY) * ip.t;
-            this.ball.rot = ip.ballFromRot + (ip.ballToRot - ip.ballFromRot) * ip.t;
-            this.ball.vx = ip.ballToVx;
-            this.ball.vy = ip.ballToVy;
-          } else {
-            // Extrapolate using velocity (late snapshot fallback)
-            this.ball.vy += GRAVITY;
-            this.ball.x += this.ball.vx;
-            this.ball.y += this.ball.vy;
-            this.ball.rot += this.ball.vx * 0.06;
-            if (this.ball.x - BALL_R < 0) { this.ball.x = BALL_R; this.ball.vx = Math.abs(this.ball.vx); }
-            if (this.ball.x + BALL_R > W) { this.ball.x = W - BALL_R; this.ball.vx = -Math.abs(this.ball.vx); }
-            if (this.ball.y - BALL_R < 0) { this.ball.y = BALL_R; this.ball.vy = Math.abs(this.ball.vy); }
+        } else {
+          // Ball on remote side → dead reckoning (extrapolate from last server snapshot)
+          // Same physics as server: gravity, walls, net, ceiling, ground
+          this.ball.vy += GRAVITY;
+          this.ball.x += this.ball.vx;
+          this.ball.y += this.ball.vy;
+          this.ball.rot += this.ball.vx * 0.06;
+          // Wall bounces
+          if (this.ball.x - BALL_R < 0) { this.ball.x = BALL_R; this.ball.vx = Math.abs(this.ball.vx); }
+          if (this.ball.x + BALL_R > W) { this.ball.x = W - BALL_R; this.ball.vx = -Math.abs(this.ball.vx); }
+          if (this.ball.y - BALL_R < 0) { this.ball.y = BALL_R; this.ball.vy = Math.abs(this.ball.vy); }
+          // Net collision
+          this.ball.hitNet(this.snd);
+          // Ground — ball visible resting on ground until server confirms score
+          if (this.ball.y + BALL_R >= GROUND_Y) {
+            this.ball.y = GROUND_Y - BALL_R;
+            this.ball.vy = 0;
+            this.ball.vx *= 0.9;
           }
+          // Trail
           this.ball.trail.push({ x: this.ball.x, y: this.ball.y });
           if (this.ball.trail.length > 5) this.ball.trail.shift();
         }
+      }
+
+      // Debug info
+      if (this._dbg) {
+        this._dbgInfo = {
+          side: mySide,
+          ballLocal: this._ballLocal,
+          ballX: Math.round(this.ball.x),
+          ballY: Math.round(this.ball.y),
+          state: this.state,
+          srvState: this._lastServerState,
+        };
       }
     }
 
@@ -1432,6 +1452,9 @@
       // touch controls overlay (native resolution)
       if (this.inp.mobile && (this.state === ST.PLAY || this.state === ST.SERVE))
         this.dTouch();
+
+      // debug overlay
+      if (this._dbg && this._dbgInfo) this.dDebug(ctx);
     }
 
     dCourt(ctx) {
@@ -1735,6 +1758,30 @@
 
       c.globalAlpha = 1;
       c.textBaseline = "alphabetic";
+    }
+
+    dDebug(ctx) {
+      const d = this._dbgInfo;
+      if (!d) return;
+      const stNames = ["MENU","SERVE","PLAY","SCORED","OVER","OL_WAIT","OL_PLAY","OL_SCORED","OL_OVER"];
+      const lines = [
+        "mode:" + this.mode + " side:" + d.side,
+        "state:" + (stNames[d.state] || d.state) + " srv:" + d.srvState,
+        "ball:" + d.ballX + "," + d.ballY + (d.ballLocal ? " LOCAL" : " REMOTE"),
+        "vx:" + this.ball.vx.toFixed(2) + " vy:" + this.ball.vy.toFixed(2),
+        "p1:" + Math.round(this.p1.x) + "," + Math.round(this.p1.y),
+        "p2:" + Math.round(this.p2.x) + "," + Math.round(this.p2.y),
+      ];
+      ctx.fillStyle = "rgba(0,0,0,0.7)";
+      ctx.fillRect(0, 0, 140, lines.length * 9 + 4);
+      ctx.fillStyle = "#00FF00";
+      ctx.font = "7px monospace";
+      ctx.textAlign = "left";
+      ctx.textBaseline = "top";
+      for (let i = 0; i < lines.length; i++) {
+        ctx.fillText(lines[i], 2, 2 + i * 9);
+      }
+      ctx.textBaseline = "alphabetic";
     }
   }
 
