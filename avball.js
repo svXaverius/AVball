@@ -401,7 +401,7 @@
         this.vy = (this.vy / spd) * 3.5;
       }
 
-      snd.hit();
+      if (snd) snd.hit();
       if (particles) particles.emit(this.x, this.y, p.color, 4, 3);
       return true;
     }
@@ -1337,8 +1337,10 @@
 
       // --- Ball: physics extrapolation between server snapshots ---
       // On each snapshot, ball is snapped to server state (above).
-      // Between snapshots, advance with gravity + wall/net/ground collisions
-      // but NO player collisions (server handles those).
+      // Between snapshots, advance with full physics including player
+      // collisions. Since we snap to server every ~2 frames, divergence
+      // from server can't accumulate. Without local player collisions,
+      // the ball visually passes through heads for 1-2 frames.
       if (this.state === ST.PLAY) {
         this.ball.vy += GRAVITY;
         this.ball.x += this.ball.vx;
@@ -1350,6 +1352,9 @@
         if (this.ball.y - BALL_R < 0) { this.ball.y = BALL_R; this.ball.vy = Math.abs(this.ball.vy); }
         // Net
         this.ball.hitNet(null); // no sound — server detects it
+        // Player collisions (local prediction, corrected on next snapshot)
+        this.ball.hitPlayer(this.p1, null, null);
+        this.ball.hitPlayer(this.p2, null, null);
         // Ground clamp
         if (this.ball.y + BALL_R >= GROUND_Y) {
           this.ball.y = GROUND_Y - BALL_R;
