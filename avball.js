@@ -1223,12 +1223,15 @@
     uOnline() {
       if (!this.nk.connected) { this.state = ST.MENU; return; }
 
+      const HYST = 10; // hysteresis zone (px) — must match server BALL_AUTH_HYST
+      const FWD_SIM_FRAMES = 4; // forward-simulate on takeover to compensate for staleness
+
       const mySide = this.nk.playerSide;
       const myPlayer = mySide === 0 ? this.p1 : this.p2;
       const remotePlayer = mySide === 0 ? this.p2 : this.p1;
       const myKey = mySide === 0 ? "p1" : "p2";
       const rmKey = mySide === 0 ? "p2" : "p1";
-      const myAuthKey = mySide === 0 ? "p1" : "p2"; // matches server ballAuth values
+      const myAuthKey = mySide === 0 ? "p1" : "p2";
 
       const localInput = this.inp.p1();
       if (this.frame % 3 === 0) this.nk.sendInput(localInput.dx, localInput.jump);
@@ -1238,14 +1241,10 @@
       if (ss && ss !== this._lastApplied) {
         this._lastApplied = ss;
 
-        // Determine ball authority from server snapshot
-        const prevBallAuth = this._ballAuthority;
-        this._ballAuthority = ss.ballAuth === myAuthKey;
-
         // Log every snapshot
         this._logEvt("SNAP", {
           srvState: ss.state, score: ss.score, timer: ss.timer, serveSide: ss.serveSide,
-          ballAuth: ss.ballAuth, localAuth: this._ballAuthority,
+          srvBallAuth: ss.ballAuth, localAuth: this._ballAuthority,
           p1: ss.p1 ? { x: +ss.p1.x.toFixed(1), y: +ss.p1.y.toFixed(1) } : null,
           p2: ss.p2 ? { x: +ss.p2.x.toFixed(1), y: +ss.p2.y.toFixed(1) } : null,
           ball: ss.ball ? { x: +ss.ball.x.toFixed(1), y: +ss.ball.y.toFixed(1), vx: +ss.ball.vx.toFixed(2), vy: +ss.ball.vy.toFixed(2) } : null,
@@ -1261,10 +1260,12 @@
         this.serveSide = ss.serveSide;
         this.timer = ss.timer;
 
-        // State transition → snap everything to server
+        // On state transitions, snap everything and reset authority from server
         if (ss.state !== this._lastServerState) {
           this._logEvt("TRANS", { from: this._lastServerState, to: ss.state, score: ss.score });
           this._lastServerState = ss.state;
+          // Reset authority from server on state transitions
+          this._ballAuthority = ss.ballAuth === myAuthKey;
           const myD = ss[myKey]; const rmD = ss[rmKey];
           if (myD) { myPlayer.x = myD.x; myPlayer.y = myD.y; myPlayer.vy = myD.vy; myPlayer.grounded = myD.grounded; }
           if (rmD) { remotePlayer.x = rmD.x; remotePlayer.y = rmD.y; remotePlayer.vy = rmD.vy; remotePlayer.grounded = rmD.grounded; }
@@ -1315,14 +1316,6 @@
           this.ball.rot = ss.ball.rot;
         }
 
-        // Authority transition: remote→local — take over ball at snapped position
-        if (this._ballAuthority && !prevBallAuth && ss.ball) {
-          this.ball.x = ss.ball.x; this.ball.y = ss.ball.y;
-          this.ball.vx = ss.ball.vx; this.ball.vy = ss.ball.vy;
-          this.ball.rot = ss.ball.rot;
-          this._logEvt("AUTH_TAKE", { x: +ss.ball.x.toFixed(1), y: +ss.ball.y.toFixed(1) });
-        }
-
         // Local player: trust local physics, only snap on major desync
         const myD = ss[myKey];
         if (myD) {
@@ -1354,6 +1347,45 @@
           const d = remotePlayer.x - prevRmX;
           if (Math.abs(d) > 0.3 && remotePlayer.grounded) remotePlayer.walkT += 0.18;
           else if (remotePlayer.grounded) remotePlayer.walkT *= 0.85;
+        }
+      }
+
+      // --- Predictive ball authority (Option A + C) ---
+      // Client determines authority locally from ball.x with hysteresis,
+      // instead of waiting for server's ballAuth (which arrives 80-150ms late).
+      // This eliminates the snap on takeover since the client already has a
+      // good extrapolated ball state when it takes over.
+      if (this.state === ST.PLAY) {
+        const prevAuth = this._ballAuthority;
+        if (this._ballAuthority) {
+          // Currently authoritative — lose authority when ball clearly crosses to other side
+          if (mySide === 0 && this.ball.x >= NET_X + HYST) this._ballAuthority = false;
+          if (mySide === 1 && this.ball.x < NET_X - HYST) this._ballAuthority = false;
+          if (!this._ballAuthority) {
+            this._logEvt("AUTH_LOSE", { x: +this.ball.x.toFixed(1), y: +this.ball.y.toFixed(1) });
+          }
+        } else {
+          // Not authoritative — gain authority when ball clearly on my side
+          if (mySide === 0 && this.ball.x < NET_X - HYST) this._ballAuthority = true;
+          if (mySide === 1 && this.ball.x >= NET_X + HYST) this._ballAuthority = true;
+          if (this._ballAuthority) {
+            // Takeover! Forward-simulate ball to compensate for server state staleness.
+            // The current extrapolated position is already a decent estimate, but
+            // apply a few frames of physics to close the gap further.
+            this._logEvt("AUTH_TAKE", {
+              x: +this.ball.x.toFixed(1), y: +this.ball.y.toFixed(1),
+              vx: +this.ball.vx.toFixed(2), vy: +this.ball.vy.toFixed(2),
+            });
+            for (let fi = 0; fi < FWD_SIM_FRAMES; fi++) {
+              this.ball.vy += GRAVITY;
+              this.ball.x += this.ball.vx;
+              this.ball.y += this.ball.vy;
+              // Walls
+              if (this.ball.x - BALL_R < 0) { this.ball.x = BALL_R; this.ball.vx = Math.abs(this.ball.vx); }
+              if (this.ball.x + BALL_R > W) { this.ball.x = W - BALL_R; this.ball.vx = -Math.abs(this.ball.vx); }
+              if (this.ball.y - BALL_R < 0) { this.ball.y = BALL_R; this.ball.vy = Math.abs(this.ball.vy); }
+            }
+          }
         }
       }
 
