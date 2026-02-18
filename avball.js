@@ -1295,6 +1295,12 @@
             }
           }
           this._prevSrvBall = { vx: ss.ball.vx, vy: ss.ball.vy, x: ss.ball.x, y: ss.ball.y };
+          // If server snap undoes a local player hit (client reversed vy but
+          // server still has original direction), skip local hitPlayer until
+          // next snapshot to avoid: local hit → server undo → ball through head.
+          const preSnapVy = this.ball.vy;
+          this._skipHitPlayer = (preSnapVy < -0.5 && ss.ball.vy > 0.5) ||
+                                (preSnapVy > 0.5 && ss.ball.vy < -0.5);
           // Snap ball to server position + velocity
           this.ball.x = ss.ball.x; this.ball.y = ss.ball.y;
           this.ball.vx = ss.ball.vx; this.ball.vy = ss.ball.vy;
@@ -1353,8 +1359,10 @@
         // Net
         this.ball.hitNet(null); // no sound — server detects it
         // Player collisions (local prediction, corrected on next snapshot)
-        this.ball.hitPlayer(this.p1, null, null);
-        this.ball.hitPlayer(this.p2, null, null);
+        if (!this._skipHitPlayer) {
+          this.ball.hitPlayer(this.p1, null, null);
+          this.ball.hitPlayer(this.p2, null, null);
+        }
         // Ground clamp
         if (this.ball.y + BALL_R >= GROUND_Y) {
           this.ball.y = GROUND_Y - BALL_R;
