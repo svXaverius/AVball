@@ -726,6 +726,7 @@
   const OP_SCORE = 3;
   const OP_GAME_OVER = 4;
   const OP_SIDE_ASSIGN = 5;
+  const OP_BALL_STATE = 6;
 
   class NakamaClient {
     constructor() {
@@ -846,6 +847,13 @@
     sendInput(dx, jump) {
       if (!this.matchId || !this.socket) return;
       this.socket.sendMatchState(this.matchId, OP_INPUT, JSON.stringify({ dx: dx, jump: jump }));
+    }
+
+    sendBallState(ball) {
+      if (!this.matchId || !this.socket) return;
+      this.socket.sendMatchState(this.matchId, OP_BALL_STATE, JSON.stringify({
+        x: ball.x, y: ball.y, vx: ball.vx, vy: ball.vy, rot: ball.rot,
+      }));
     }
 
     async leaveMatch() {
@@ -1220,6 +1228,7 @@
       const remotePlayer = mySide === 0 ? this.p2 : this.p1;
       const myKey = mySide === 0 ? "p1" : "p2";
       const rmKey = mySide === 0 ? "p2" : "p1";
+      const myAuthKey = mySide === 0 ? "p1" : "p2"; // matches server ballAuth values
 
       const localInput = this.inp.p1();
       if (this.frame % 3 === 0) this.nk.sendInput(localInput.dx, localInput.jump);
@@ -1229,9 +1238,14 @@
       if (ss && ss !== this._lastApplied) {
         this._lastApplied = ss;
 
+        // Determine ball authority from server snapshot
+        const prevBallAuth = this._ballAuthority;
+        this._ballAuthority = ss.ballAuth === myAuthKey;
+
         // Log every snapshot
         this._logEvt("SNAP", {
           srvState: ss.state, score: ss.score, timer: ss.timer, serveSide: ss.serveSide,
+          ballAuth: ss.ballAuth, localAuth: this._ballAuthority,
           p1: ss.p1 ? { x: +ss.p1.x.toFixed(1), y: +ss.p1.y.toFixed(1) } : null,
           p2: ss.p2 ? { x: +ss.p2.x.toFixed(1), y: +ss.p2.y.toFixed(1) } : null,
           ball: ss.ball ? { x: +ss.ball.x.toFixed(1), y: +ss.ball.y.toFixed(1), vx: +ss.ball.vx.toFixed(2), vy: +ss.ball.vy.toFixed(2) } : null,
@@ -1276,8 +1290,8 @@
           t: 0,
         };
 
-        // Ball: snap to server state on each snapshot
-        if (ss.ball) {
+        // Ball: only snap to server when NOT authoritative
+        if (!this._ballAuthority && ss.ball) {
           // Detect sounds from velocity changes vs previous snapshot
           if (this._prevSrvBall) {
             const pb = this._prevSrvBall; const nb = ss.ball;
@@ -1299,6 +1313,14 @@
           this.ball.x = ss.ball.x; this.ball.y = ss.ball.y;
           this.ball.vx = ss.ball.vx; this.ball.vy = ss.ball.vy;
           this.ball.rot = ss.ball.rot;
+        }
+
+        // Authority transition: remote→local — take over ball at snapped position
+        if (this._ballAuthority && !prevBallAuth && ss.ball) {
+          this.ball.x = ss.ball.x; this.ball.y = ss.ball.y;
+          this.ball.vx = ss.ball.vx; this.ball.vy = ss.ball.vy;
+          this.ball.rot = ss.ball.rot;
+          this._logEvt("AUTH_TAKE", { x: +ss.ball.x.toFixed(1), y: +ss.ball.y.toFixed(1) });
         }
 
         // Local player: trust local physics, only snap on major desync
@@ -1335,39 +1357,56 @@
         }
       }
 
-      // --- Ball: physics extrapolation between server snapshots ---
-      // On each snapshot, ball is snapped to server state (above).
-      // Between snapshots, advance with full physics including player
-      // collisions. Since we snap to server every ~2 frames, divergence
-      // from server can't accumulate. Without local player collisions,
-      // the ball visually passes through heads for 1-2 frames.
+      // --- Ball physics ---
       if (this.state === ST.PLAY) {
-        this.ball.vy += GRAVITY;
-        this.ball.x += this.ball.vx;
-        this.ball.y += this.ball.vy;
-        this.ball.rot += this.ball.vx * 0.06;
-        // Walls
-        if (this.ball.x - BALL_R < 0) { this.ball.x = BALL_R; this.ball.vx = Math.abs(this.ball.vx); }
-        if (this.ball.x + BALL_R > W) { this.ball.x = W - BALL_R; this.ball.vx = -Math.abs(this.ball.vx); }
-        if (this.ball.y - BALL_R < 0) { this.ball.y = BALL_R; this.ball.vy = Math.abs(this.ball.vy); }
-        // Net
-        this.ball.hitNet(null); // no sound — server detects it
-        // Player collisions (local prediction, corrected on next snapshot)
-        this.ball.hitPlayer(this.p1, null, null);
-        this.ball.hitPlayer(this.p2, null, null);
-        // Ground clamp
-        if (this.ball.y + BALL_R >= GROUND_Y) {
-          this.ball.y = GROUND_Y - BALL_R;
-          this.ball.vy = 0; this.ball.vx *= 0.9;
+        if (this._ballAuthority) {
+          // AUTHORITATIVE: run full local physics with sounds + particles
+          const scorer = this.ball.update(this.snd);
+          this.ball.hitPlayer(this.p1, this.snd, this.particles);
+          this.ball.hitPlayer(this.p2, this.snd, this.particles);
+          // Send ball state to server (throttled same as input)
+          if (this.frame % 3 === 0) this.nk.sendBallState(this.ball);
+          // Ground clamp (don't let ball fall through while waiting for server scoring)
+          if (this.ball.y + BALL_R >= GROUND_Y) {
+            this.ball.y = GROUND_Y - BALL_R;
+            this.ball.vy = 0; this.ball.vx *= 0.9;
+          }
+        } else {
+          // NON-AUTHORITATIVE: extrapolate between server snapshots
+          this.ball.vy += GRAVITY;
+          this.ball.x += this.ball.vx;
+          this.ball.y += this.ball.vy;
+          this.ball.rot += this.ball.vx * 0.06;
+          // Walls
+          if (this.ball.x - BALL_R < 0) { this.ball.x = BALL_R; this.ball.vx = Math.abs(this.ball.vx); }
+          if (this.ball.x + BALL_R > W) { this.ball.x = W - BALL_R; this.ball.vx = -Math.abs(this.ball.vx); }
+          if (this.ball.y - BALL_R < 0) { this.ball.y = BALL_R; this.ball.vy = Math.abs(this.ball.vy); }
+          // Net
+          this.ball.hitNet(null);
+          // Player collisions (prediction, corrected on next snapshot)
+          this.ball.hitPlayer(this.p1, null, null);
+          this.ball.hitPlayer(this.p2, null, null);
+          // Ground clamp
+          if (this.ball.y + BALL_R >= GROUND_Y) {
+            this.ball.y = GROUND_Y - BALL_R;
+            this.ball.vy = 0; this.ball.vx *= 0.9;
+          }
+          this.ball.trail.push({ x: this.ball.x, y: this.ball.y });
+          if (this.ball.trail.length > 5) this.ball.trail.shift();
         }
-        this.ball.trail.push({ x: this.ball.x, y: this.ball.y });
-        if (this.ball.trail.length > 5) this.ball.trail.shift();
+      } else if (this.state === ST.SERVE && this._ballAuthority) {
+        // Authoritative during serve: position ball above serving player
+        this.ball.x = this.serveSide === 0 ? W * 0.25 : W * 0.75;
+        this.ball.y = 30;
+        this.ball.vx = 0; this.ball.vy = 0; this.ball.rot = 0;
+        this.ball.trail = [];
+        if (this.frame % 3 === 0) this.nk.sendBallState(this.ball);
       }
 
       // Periodic frame log (every 30 frames ≈ 2x/sec)
       if (this.frame % 30 === 0 && this.state >= ST.SERVE && this.state <= ST.SCORED) {
         this._logEvt("TICK", {
-          state: this.state,
+          state: this.state, ballAuth: this._ballAuthority,
           ball: { x: +this.ball.x.toFixed(1), y: +this.ball.y.toFixed(1), vx: +this.ball.vx.toFixed(2), vy: +this.ball.vy.toFixed(2) },
           my: { x: +myPlayer.x.toFixed(1), y: +myPlayer.y.toFixed(1) },
           rm: { x: +remotePlayer.x.toFixed(1), y: +remotePlayer.y.toFixed(1) },
@@ -1379,6 +1418,7 @@
         this._dbgInfo = {
           side: mySide,
           ballX: Math.round(this.ball.x), ballY: Math.round(this.ball.y),
+          ballLocal: this._ballAuthority,
           state: this.state, srvState: this._lastServerState,
         };
       }
