@@ -862,7 +862,7 @@ function rpcArkanoidSubmitScore(
   var data: any;
   try { data = JSON.parse(payload); } catch (e) { throw Error('invalid payload'); }
   var score = Math.floor(Number(data.score) || 0);
-  if (score < 0 || score > 1000000) throw Error('invalid score');
+  if (score <= 0 || score > 1000000) throw Error('invalid score');
 
   // Rate limit
   var now = Math.floor(Date.now() / 1000);
