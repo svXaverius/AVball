@@ -19,6 +19,7 @@ const P_SPEED = 2.5;
 const JUMP_VEL = -3.1;
 const WIN_SCORE = 15;
 const BOUNCE_DAMP = 0.85;
+const BALL_AUTH_HYST = 10; // hysteresis zone (px) for authority handoff at net
 
 // ============================================================
 // TYPES
@@ -61,6 +62,8 @@ interface MatchState {
   isAiMatch: boolean;
   aiTick: number;
   aiTargetX: number;
+  pendingBallState: { senderId: string; x: number; y: number; vx: number; vy: number; rot: number } | null;
+  ballAuthState: string; // tracks current ball authority for hysteresis: "p1", "p2", or "server"
 }
 
 interface EloResult {
@@ -304,6 +307,7 @@ var OP_STATE = 2;
 var OP_SCORE = 3;
 var OP_GAME_OVER = 4;
 var OP_SIDE_ASSIGN = 5;
+var OP_BALL_STATE = 6;
 
 // Game states
 var ST_WAITING = 0;
@@ -406,6 +410,8 @@ var matchInit: nkruntime.MatchInitFunction = function (ctx, logger, nk, params) 
     isAiMatch: !!isAiMatch,
     aiTick: 0,
     aiTargetX: W * 0.75,
+    pendingBallState: null,
+    ballAuthState: 'server',
   };
   return {
     state: state,
@@ -561,12 +567,12 @@ var matchLoop: nkruntime.MatchLoopFunction = function (
   // Process input messages
   for (var i = 0; i < messages.length; i++) {
     var msg = messages[i];
+    // Fix #5: only accept messages from match participants
+    if (!(msg.sender.userId in s.playerSides)) {
+      logger.warn('Input from non-participant: %s', msg.sender.userId);
+      continue;
+    }
     if (msg.opCode === OP_INPUT) {
-      // Fix #5: only accept input from match participants
-      if (!(msg.sender.userId in s.playerSides)) {
-        logger.warn('Input from non-participant: %s', msg.sender.userId);
-        continue;
-      }
       try {
         var data = JSON.parse(nk.binaryToString(msg.data));
         var dx = Math.max(-1, Math.min(1, Math.round(data.dx || 0)));
@@ -574,6 +580,19 @@ var matchLoop: nkruntime.MatchLoopFunction = function (
         s.inputs[msg.sender.userId] = { dx: dx, jump: jump };
       } catch (e) {
         logger.warn('Malformed input from %s', msg.sender.userId);
+      }
+    } else if (msg.opCode === OP_BALL_STATE) {
+      try {
+        var bdata = JSON.parse(nk.binaryToString(msg.data));
+        // Store for later processing (validated in physics step)
+        s.pendingBallState = {
+          senderId: msg.sender.userId,
+          x: +bdata.x, y: +bdata.y,
+          vx: +bdata.vx, vy: +bdata.vy,
+          rot: +bdata.rot,
+        };
+      } catch (e) {
+        logger.warn('Malformed ball state from %s', msg.sender.userId);
       }
     }
   }
@@ -596,21 +615,113 @@ var matchLoop: nkruntime.MatchLoopFunction = function (
     p2Input = s.inputs[p2UserId] || { dx: 0, jump: false };
   }
 
+  // Determine ball authority with hysteresis to prevent flip-flopping at net.
+  // "p1" = P1's client, "p2" = P2's client, "server" = server runs physics.
+  // Hysteresis: authority only switches when ball is BALL_AUTH_HYST pixels past the net.
+  var p1IsHuman = p1UserId !== AI_USER_ID && p1UserId !== '';
+  var p2IsHuman = p2UserId !== AI_USER_ID && p2UserId !== '';
+  var ballAuth = 'server';
+  if (s.gameState === ST_SERVE) {
+    // During serve, serving player's client is authoritative (if human)
+    var serveUserId = s.serveSide === 0 ? p1UserId : p2UserId;
+    if (serveUserId !== AI_USER_ID && serveUserId !== '') ballAuth = s.serveSide === 0 ? 'p1' : 'p2';
+  } else if (s.gameState === ST_PLAY) {
+    // Hysteresis: keep current authority unless ball clearly crossed to other side
+    if (s.ballAuthState === 'p1') {
+      if (s.ball.x >= NET_X + BALL_AUTH_HYST) {
+        ballAuth = p2IsHuman ? 'p2' : 'server';
+      } else {
+        ballAuth = 'p1'; // stay — ball still in hysteresis zone or on P1's side
+      }
+    } else if (s.ballAuthState === 'p2') {
+      if (s.ball.x < NET_X - BALL_AUTH_HYST) {
+        ballAuth = p1IsHuman ? 'p1' : 'server';
+      } else {
+        ballAuth = 'p2'; // stay
+      }
+    } else {
+      // Server was authoritative (initial or AI transition) — use normal threshold
+      if (s.ball.x < NET_X) {
+        ballAuth = p1IsHuman ? 'p1' : 'server';
+      } else {
+        ballAuth = p2IsHuman ? 'p2' : 'server';
+      }
+    }
+  }
+  s.ballAuthState = ballAuth;
+
+  // Apply pending ball state from authoritative client.
+  // Accept from current auth, or from a client whose side the ball is on
+  // (predictive clients may send slightly before server switches authority).
+  var clientBallApplied = false;
+  if (s.pendingBallState && ballAuth !== 'server') {
+    var expectedSender = ballAuth === 'p1' ? p1UserId : p2UserId;
+    if (s.pendingBallState.senderId === expectedSender) {
+      s.ball.x = s.pendingBallState.x;
+      s.ball.y = s.pendingBallState.y;
+      s.ball.vx = s.pendingBallState.vx;
+      s.ball.vy = s.pendingBallState.vy;
+      s.ball.rot = s.pendingBallState.rot;
+      clientBallApplied = true;
+    }
+  } else if (s.pendingBallState && ballAuth === 'server') {
+    // Server is auth (AI side), but a human client sent ball state — they may
+    // be predicting authority before hysteresis threshold. Accept if ball is
+    // within the hysteresis zone on the sender's side.
+    var senderSide = s.playerSides[s.pendingBallState.senderId];
+    if (senderSide === 0 && s.ball.x < NET_X + BALL_AUTH_HYST && p1IsHuman) {
+      s.ball.x = s.pendingBallState.x;
+      s.ball.y = s.pendingBallState.y;
+      s.ball.vx = s.pendingBallState.vx;
+      s.ball.vy = s.pendingBallState.vy;
+      s.ball.rot = s.pendingBallState.rot;
+      clientBallApplied = true;
+      ballAuth = 'p1';
+      s.ballAuthState = ballAuth;
+    } else if (senderSide === 1 && s.ball.x >= NET_X - BALL_AUTH_HYST && p2IsHuman) {
+      s.ball.x = s.pendingBallState.x;
+      s.ball.y = s.pendingBallState.y;
+      s.ball.vx = s.pendingBallState.vx;
+      s.ball.vy = s.pendingBallState.vy;
+      s.ball.rot = s.pendingBallState.rot;
+      clientBallApplied = true;
+      ballAuth = 'p2';
+      s.ballAuthState = ballAuth;
+    }
+  }
+  s.pendingBallState = null;
+
   // State machine
   if (s.gameState === ST_SERVE) {
     updatePlayer(s.p1, p1Input);
     updatePlayer(s.p2, p2Input);
     s.timer--;
     if (s.timer <= 0) {
-      serveBall(s.ball, s.serveSide);
+      // Only server sets the serve ball position if server is authoritative
+      if (ballAuth === 'server') {
+        serveBall(s.ball, s.serveSide);
+      }
       s.gameState = ST_PLAY;
+      s.ballAuthState = 'server'; // reset for fresh authority determination
     }
   } else if (s.gameState === ST_PLAY) {
     updatePlayer(s.p1, p1Input);
     updatePlayer(s.p2, p2Input);
-    var scorer = updateBall(s.ball);
-    ballHitPlayer(s.ball, s.p1);
-    ballHitPlayer(s.ball, s.p2);
+
+    // Ball physics: run on server when server is authoritative, OR as a bridge
+    // when the authoritative client didn't send a ball state this tick (covers
+    // the gap between client dropping authority and server threshold crossing).
+    var scorer = -1;
+    if (ballAuth === 'server' || !clientBallApplied) {
+      scorer = updateBall(s.ball);
+      ballHitPlayer(s.ball, s.p1);
+      ballHitPlayer(s.ball, s.p2);
+    } else {
+      // Client sent authoritative ball state — just check for scoring
+      if (s.ball.y + BALL_R >= GROUND_Y) {
+        scorer = s.ball.x < NET_X ? 1 : 0;
+      }
+    }
 
     if (scorer >= 0) {
       s.score[scorer]++;
@@ -672,6 +783,21 @@ var matchLoop: nkruntime.MatchLoopFunction = function (
     return null; // end match
   }
 
+  // Recompute ballAuth after state machine — ensures broadcasts after state
+  // transitions (SCORED→SERVE, SERVE→PLAY) have the correct authority value.
+  if (s.gameState === ST_SERVE) {
+    var serveUserId2 = s.serveSide === 0 ? p1UserId : p2UserId;
+    if (serveUserId2 !== AI_USER_ID && serveUserId2 !== '') {
+      ballAuth = s.serveSide === 0 ? 'p1' : 'p2';
+    } else {
+      ballAuth = 'server';
+    }
+    s.ballAuthState = ballAuth;
+  } else if (s.gameState === ST_SCORED || s.gameState === ST_OVER) {
+    ballAuth = 'server';
+    s.ballAuthState = 'server';
+  }
+
   // Broadcast state at 20Hz
   if (s.tickCount % BROADCAST_INTERVAL === 0) {
     var snapshot = JSON.stringify({
@@ -682,6 +808,9 @@ var matchLoop: nkruntime.MatchLoopFunction = function (
       p1: { x: s.p1.x, y: s.p1.y, vy: s.p1.vy, grounded: s.p1.grounded },
       p2: { x: s.p2.x, y: s.p2.y, vy: s.p2.vy, grounded: s.p2.grounded },
       ball: { x: s.ball.x, y: s.ball.y, vx: s.ball.vx, vy: s.ball.vy, rot: s.ball.rot },
+      inp1: p1Input,
+      inp2: p2Input,
+      ballAuth: ballAuth,
     });
     var broadcastTargets = Object.keys(s.presences).map(function(k) { return s.presences[k]; });
     dispatcher.broadcastMessage(OP_STATE, snapshot, broadcastTargets);
@@ -716,6 +845,62 @@ var matchmakerMatched: nkruntime.MatchmakerMatchedFunction = function (
 };
 
 // ============================================================
+// ARKANOID SCORE LEADERBOARD
+// ============================================================
+var ARKANOID_LB_ID = 'arkanoid_scores';
+var ARKANOID_SUBMIT_COOLDOWN = 20; // seconds between submissions
+
+function rpcArkanoidSubmitScore(
+  ctx: nkruntime.Context,
+  logger: nkruntime.Logger,
+  nk: nkruntime.Nakama,
+  payload: string
+): string {
+  var userId = ctx.userId;
+  if (!userId) throw Error('authentication required');
+
+  var data: any;
+  try { data = JSON.parse(payload); } catch (e) { throw Error('invalid payload'); }
+  var score = Math.floor(Number(data.score) || 0);
+  if (score < 0 || score > 1000000) throw Error('invalid score');
+
+  // Rate limit
+  var now = Math.floor(Date.now() / 1000);
+  var stored = nk.storageRead([{ collection: 'rate_limit', key: 'arkanoid_submit', userId: userId }]);
+  if (stored.length > 0 && stored[0].value && stored[0].value['ts']) {
+    var lastTs = stored[0].value['ts'] as number;
+    if (now - lastTs < ARKANOID_SUBMIT_COOLDOWN) {
+      return JSON.stringify({ ok: false, reason: 'rate_limited' });
+    }
+  }
+  nk.storageWrite([{
+    collection: 'rate_limit', key: 'arkanoid_submit', userId: userId,
+    value: { ts: now }, permissionRead: 0, permissionWrite: 0,
+  }]);
+
+  var account = nk.accountGetId(userId);
+  var username = account.user.username || 'Player';
+  nk.leaderboardRecordWrite(ARKANOID_LB_ID, userId, username, score, 0);
+
+  var records = nk.leaderboardRecordsList(ARKANOID_LB_ID, [userId], 1);
+  var rank = (records.records && records.records.length > 0) ? records.records[0].rank : null;
+  return JSON.stringify({ ok: true, rank: rank });
+}
+
+function rpcArkanoidGetLeaderboard(
+  ctx: nkruntime.Context,
+  logger: nkruntime.Logger,
+  nk: nkruntime.Nakama,
+  payload: string
+): string {
+  var records = nk.leaderboardRecordsList(ARKANOID_LB_ID, [], 10);
+  var result = (records.records || []).map(function(r) {
+    return { username: r.username, score: r.score, rank: r.rank };
+  });
+  return JSON.stringify(result);
+}
+
+// ============================================================
 // MODULE INIT
 // ============================================================
 var InitModule: nkruntime.InitModule = function (ctx, logger, nk, initializer) {
@@ -734,6 +919,8 @@ var InitModule: nkruntime.InitModule = function (ctx, logger, nk, initializer) {
   initializer.registerRpc('get_leaderboard', rpcGetLeaderboard);
   initializer.registerRpc('get_player_elo', rpcGetPlayerElo);
   initializer.registerRpc('create_ai_match', rpcCreateAiMatch);
+  initializer.registerRpc('arkanoid_submit_score', rpcArkanoidSubmitScore);
+  initializer.registerRpc('arkanoid_get_leaderboard', rpcArkanoidGetLeaderboard);
 
   // Create ELO leaderboard
   try {
@@ -748,6 +935,21 @@ var InitModule: nkruntime.InitModule = function (ctx, logger, nk, initializer) {
     logger.info('Leaderboard created: %s', LEADERBOARD_ID);
   } catch (e) {
     logger.debug('Leaderboard already exists');
+  }
+
+  // Create Arkanoid score leaderboard
+  try {
+    nk.leaderboardCreate(
+      ARKANOID_LB_ID,
+      false,
+      nkruntime.SortOrder.DESCENDING,
+      nkruntime.Operator.BEST,
+      '',
+      {}
+    );
+    logger.info('Leaderboard created: %s', ARKANOID_LB_ID);
+  } catch (e) {
+    logger.debug('Arkanoid leaderboard already exists');
   }
 
   // Ensure CPU bot user exists
